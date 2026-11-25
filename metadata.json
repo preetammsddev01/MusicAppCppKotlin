@@ -1,0 +1,6 @@
+{
+  "name": "Aether Audio",
+  "description": "Hi-Res FLAC cloud music player with multi-band equalizer, Bass Boost, Virtualizer DSP, and dynamic album-art theming.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

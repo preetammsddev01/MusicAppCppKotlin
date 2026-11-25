@@ -1,0 +1,25 @@
+<resources>
+    <string name="app_name">Aether Audio</string>
+    <string name="nav_home">Home</string>
+    <string name="nav_search">Search</string>
+    <string name="nav_library">Library</string>
+    <string name="nav_equalizer">Equalizer</string>
+    <string name="home_featured_label">FEATURED HI-RES</string>
+    <string name="home_quick_picks">Quick Picks</string>
+    <string name="home_recently_played">Recently Played</string>
+    <string name="home_hires_releases">Hi-Res FLAC Releases</string>
+    <string name="home_albums">Albums</string>
+    <string name="search_title">Search</string>
+    <string name="search_tracks_hint">Songs, artists, albums, or FLAC…</string>
+    <string name="library_title">Your Library</string>
+    <string name="liked_songs_title">Liked Songs</string>
+    <string name="create_playlist_action">New Playlist</string>
+    <string name="now_playing_label">NOW PLAYING</string>
+    <string name="equalizer_title">DSP Studio</string>
+    <string name="dsp_bypass_label">DSP Engine</string>
+    <string name="bass_boost_label">Bass Boost</string>
+    <string name="virtualizer_label">Spatial Width</string>
+    <string name="playback_notification_channel">Hi-Res Audio Playback</string>
+    <string name="catalog_unavailable_title">Music Stream Unavailable</string>
+    <string name="catalog_unavailable_subtitle">Unable to load tracks right now. Tap Retry Connection or verify the streaming catalog manifest is online.</string>
+</resources>
