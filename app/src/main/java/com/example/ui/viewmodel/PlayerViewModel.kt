@@ -4,6 +4,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.media3.common.Player
+import com.example.audio.EphemeralAudioCacheManager
+import com.example.audio.TempPrepStatus
+import com.example.audio.TempTrackState
 import com.example.data.model.TrackEntity
 import com.example.data.remote.CloudMusicRepository
 import com.example.playback.DecodedAudioTelemetry
@@ -13,11 +16,13 @@ import com.example.ui.theme.LosslessCyan
 import com.example.ui.theme.StudioAmber
 import com.example.ui.util.AlbumArtPaletteExtractor
 import com.example.ui.util.ExtractedAlbumColors
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -28,7 +33,6 @@ data class PlaybackUiState(
     val currentQueueIndex: Int = -1,
     val isPlaying: Boolean = false,
     val isBuffering: Boolean = false,
-    val positionMs: Long = 0L,
     val durationMs: Long = 0L,
     val shuffleEnabled: Boolean = false,
     val repeatMode: Int = Player.REPEAT_MODE_OFF,
@@ -37,25 +41,42 @@ data class PlaybackUiState(
     val isHiResSignal: Boolean = false,
     val accentColor: Color = StudioAmber,
     val secondaryGlowColor: Color = LosslessCyan,
+    val isPreparingAudio: Boolean = false,
+    val prepStatusMessage: String? = null,
+    val prepProgress: Float = 0f,
+    val currentPrepState: TempTrackState? = null,
+    val queuePrepStates: Map<String, TempTrackState> = emptyMap(),
+    val cachedQueueCount: Int = 0,
     val errorMessage: String? = null
 )
 
 class PlayerViewModel(
     private val repository: CloudMusicRepository,
     private val playbackController: PlaybackController,
+    private val cacheManager: EphemeralAudioCacheManager,
     private val telemetryBus: PlaybackTelemetryBus,
     private val paletteExtractor: AlbumArtPaletteExtractor
 ) : ViewModel() {
 
     private val extractedColors = MutableStateFlow(ExtractedAlbumColors())
+    val accentColors: StateFlow<ExtractedAlbumColors> = extractedColors
+    val positionMs: StateFlow<Long> = playbackController.positionMs
 
-    val uiState: StateFlow<PlaybackUiState> = combine(
+    private val playerAndLibraryFlow = combine(
         playbackController.snapshot,
         repository.observeAllTracks(),
         telemetryBus.telemetry,
         extractedColors
     ) { snapshot, tracks, telemetry, colors ->
-        val trackMap = tracks.associateBy { it.id }
+        PlayerBaseBundle(snapshot, tracks, telemetry, colors)
+    }
+
+    val uiState: StateFlow<PlaybackUiState> = combine(
+        playerAndLibraryFlow,
+        cacheManager.states
+    ) { base, prepStates ->
+        val snapshot = base.snapshot
+        val trackMap = base.tracks.associateBy { it.id }
         val queue = snapshot.queueMediaIds.mapNotNull { trackMap[it] }
         val currentTrack = snapshot.currentMediaId?.let { trackMap[it] }
             ?: queue.getOrNull(snapshot.currentQueueIndex)
@@ -66,31 +87,58 @@ class PlayerViewModel(
             else -> 0L
         }
 
-        val signalLabel = buildSignalLabel(currentTrack, telemetry)
+        val currentPrep = currentTrack?.let { prepStates[it.id] }
+        val cachedCount = queue.count { prepStates[it.id]?.status == TempPrepStatus.READY }
+        val signalLabel = buildSignalLabel(currentTrack, base.telemetry)
         val isHiRes = (currentTrack?.isHiRes == true) ||
-            (telemetry.sampleRateHz > 44100 || telemetry.bitDepth >= 24)
+            (base.telemetry.sampleRateHz > 44100 || base.telemetry.bitDepth >= 24)
+
+        val activePrepMsg = snapshot.prepStatusMessage ?: when (currentPrep?.status) {
+            TempPrepStatus.DOWNLOADING -> {
+                val pct = (currentPrep.progress * 100).toInt()
+                if (pct > 0) "Downloading audio · $pct%" else "Downloading audio..."
+            }
+            TempPrepStatus.CONVERTING -> "Converting audio bytes..."
+            else -> null
+        }
 
         PlaybackUiState(
             currentTrack = currentTrack,
             queue = queue,
             currentQueueIndex = snapshot.currentQueueIndex,
             isPlaying = snapshot.isPlaying,
-            isBuffering = snapshot.isBuffering,
-            positionMs = snapshot.positionMs,
+            isBuffering = snapshot.isBuffering || snapshot.isPreparingAudio,
             durationMs = resolvedDuration,
             shuffleEnabled = snapshot.shuffleEnabled,
             repeatMode = snapshot.repeatMode,
-            liveTelemetry = telemetry,
+            liveTelemetry = base.telemetry,
             signalDisplayLabel = signalLabel,
             isHiResSignal = isHiRes,
-            accentColor = colors.primaryAccent,
-            secondaryGlowColor = colors.secondaryGlow,
+            accentColor = base.colors.primaryAccent,
+            secondaryGlowColor = base.colors.secondaryGlow,
+            isPreparingAudio = snapshot.isPreparingAudio ||
+                currentPrep?.status == TempPrepStatus.DOWNLOADING ||
+                currentPrep?.status == TempPrepStatus.CONVERTING,
+            prepStatusMessage = activePrepMsg,
+            prepProgress = currentPrep?.progress ?: 0f,
+            currentPrepState = currentPrep,
+            queuePrepStates = prepStates,
+            cachedQueueCount = cachedCount,
             errorMessage = snapshot.errorMessage
         )
-    }.stateIn(
-        scope = viewModelScope,
-        started = SharingStarted.WhileSubscribed(5000),
-        initialValue = PlaybackUiState()
+    }
+        .flowOn(Dispatchers.Default)
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = PlaybackUiState()
+        )
+
+    private data class PlayerBaseBundle(
+        val snapshot: com.example.playback.ControllerSnapshot,
+        val tracks: List<TrackEntity>,
+        val telemetry: DecodedAudioTelemetry,
+        val colors: com.example.ui.util.ExtractedAlbumColors
     )
 
     init {

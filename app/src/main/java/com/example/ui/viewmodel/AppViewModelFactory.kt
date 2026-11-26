@@ -21,6 +21,7 @@ class AppViewModelFactory(private val app: AetherAudioApp) : ViewModelProvider.F
                 PlayerViewModel(
                     repository = app.cloudRepository,
                     playbackController = app.playbackController,
+                    cacheManager = app.ephemeralAudioCacheManager,
                     telemetryBus = app.telemetryBus,
                     paletteExtractor = app.paletteExtractor
                 ) as T

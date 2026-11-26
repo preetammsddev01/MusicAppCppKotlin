@@ -16,6 +16,8 @@ class NativeDspAudioProcessor(
 
     private var nativeHandle: Long = NativeDspBridge.create()
     private var encodingType: Int = ENCODING_PCM_16
+    @Volatile
+    private var processingActiveCached: Boolean = false
 
     @Synchronized
     fun updateDspState(state: EqualizerState) {
@@ -28,7 +30,9 @@ class NativeDspAudioProcessor(
             bassBoostStrength = state.bassBoostStrength,
             virtualizerStrength = state.virtualizerStrength
         )
-        onStateChanged(outputAudioFormat != AudioFormat.NOT_SET, isProcessingActiveNow())
+        val active = isProcessingActiveNow()
+        processingActiveCached = active
+        onStateChanged(outputAudioFormat != AudioFormat.NOT_SET, active)
     }
 
     fun isProcessingActiveNow(): Boolean {
@@ -41,6 +45,7 @@ class NativeDspAudioProcessor(
 
     override fun onConfigure(inputAudioFormat: AudioFormat): AudioFormat {
         if (!NativeDspBridge.isNativeLoaded) {
+            processingActiveCached = false
             onStateChanged(false, false)
             return AudioFormat.NOT_SET
         }
@@ -63,7 +68,9 @@ class NativeDspAudioProcessor(
             channelCount = inputAudioFormat.channelCount,
             encodingType = encodingType
         )
-        onStateChanged(true, isProcessingActiveNow())
+        val active = isProcessingActiveNow()
+        processingActiveCached = active
+        onStateChanged(true, active)
         return inputAudioFormat
     }
 
@@ -71,18 +78,23 @@ class NativeDspAudioProcessor(
         val remaining = inputBuffer.remaining()
         if (remaining <= 0) return
 
-        val outBuffer = replaceOutputBuffer(remaining)
         val frameBytes = inputAudioFormat.bytesPerFrame.coerceAtLeast(1)
         val frameCount = remaining / frameBytes
+        if (frameCount <= 0) return
 
-        if (frameCount <= 0 || !NativeDspBridge.isProcessingActive(nativeHandle)) {
-            // Bit-exact zero-modification bypass copy
+        val byteCount = frameCount * frameBytes
+        val outBuffer = replaceOutputBuffer(byteCount)
+
+        if (!processingActiveCached) {
+            // Bit-exact zero-modification bypass copy (strictly frame-aligned)
+            val origLimit = inputBuffer.limit()
+            inputBuffer.limit(inputBuffer.position() + byteCount)
             outBuffer.put(inputBuffer)
+            inputBuffer.limit(origLimit)
             outBuffer.flip()
             return
         }
 
-        val byteCount = frameCount * frameBytes
         if (inputBuffer.isDirect && outBuffer.isDirect) {
             val processed = NativeDspBridge.processDirectBuffer(
                 handle = nativeHandle,

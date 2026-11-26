@@ -10,7 +10,7 @@ add_library(
 )
 
 target_compile_features(aether_dsp PRIVATE cxx_std_17)
-target_compile_options(aether_dsp PRIVATE -O3 -ffast-math -Wall -Wextra)
+target_compile_options(aether_dsp PRIVATE -O3 -Wall -Wextra)
 
 find_library(log-lib log)
 

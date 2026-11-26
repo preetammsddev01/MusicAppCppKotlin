@@ -7,6 +7,7 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -57,6 +58,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.testTag
@@ -65,6 +69,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
 import com.example.R
 import com.example.data.model.PlaylistWithTracks
@@ -75,6 +80,7 @@ import com.example.ui.theme.StudioConsole
 import com.example.ui.theme.TelemetryTextStyle
 import com.example.ui.theme.TonalRack
 import com.example.ui.theme.VerifiedEmerald
+import kotlinx.coroutines.flow.StateFlow
 import java.util.Locale
 
 fun formatDurationMs(durationMs: Long): String {
@@ -175,20 +181,38 @@ fun AnimatedWaveformBars(
         label = "bar3"
     )
 
-    Row(
-        modifier = modifier.height(16.dp),
-        horizontalArrangement = Arrangement.spacedBy(2.dp),
-        verticalAlignment = Alignment.Bottom
+    Canvas(
+        modifier = modifier
+            .width(13.dp)
+            .height(16.dp)
     ) {
-        listOf(bar1, bar2, bar3).forEach { fraction ->
-            Box(
-                modifier = Modifier
-                    .width(3.dp)
-                    .height(16.dp * fraction)
-                    .clip(RoundedCornerShape(2.dp))
-                    .background(color)
-            )
-        }
+        val barWidth = 3.dp.toPx()
+        val gap = 2.dp.toPx()
+        val radius = CornerRadius(2.dp.toPx(), 2.dp.toPx())
+        val h = size.height
+
+        val h1 = (h * bar1).coerceAtLeast(2.dp.toPx())
+        val h2 = (h * bar2).coerceAtLeast(2.dp.toPx())
+        val h3 = (h * bar3).coerceAtLeast(2.dp.toPx())
+
+        drawRoundRect(
+            color = color,
+            topLeft = Offset(0f, h - h1),
+            size = Size(barWidth, h1),
+            cornerRadius = radius
+        )
+        drawRoundRect(
+            color = color,
+            topLeft = Offset(barWidth + gap, h - h2),
+            size = Size(barWidth, h2),
+            cornerRadius = radius
+        )
+        drawRoundRect(
+            color = color,
+            topLeft = Offset((barWidth + gap) * 2f, h - h3),
+            size = Size(barWidth, h3),
+            cornerRadius = radius
+        )
     }
 }
 
@@ -300,18 +324,18 @@ fun MiniPlayerBar(
     track: TrackEntity,
     isPlaying: Boolean,
     isBuffering: Boolean,
-    positionMs: Long,
+    positionMsFlow: StateFlow<Long>,
     durationMs: Long,
     signalLabel: String,
     isHiRes: Boolean,
+    prepStatusMessage: String? = null,
+    prepProgress: Float = 0f,
     onExpand: () -> Unit,
     onToggleLike: () -> Unit,
     onTogglePlayPause: () -> Unit,
     onSkipNext: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val progress = if (durationMs > 0L) (positionMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f) else 0f
-
     Surface(
         modifier = modifier
             .fillMaxWidth()
@@ -324,13 +348,11 @@ fun MiniPlayerBar(
         tonalElevation = 6.dp
     ) {
         Column(modifier = Modifier.fillMaxWidth()) {
-            LinearProgressIndicator(
-                progress = { progress },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(2.dp),
-                color = MaterialTheme.colorScheme.primary,
-                trackColor = HairlineBorder
+            MiniPlayerProgressIndicator(
+                positionMsFlow = positionMsFlow,
+                durationMs = durationMs,
+                prepStatusMessage = prepStatusMessage,
+                prepProgress = prepProgress
             )
             Row(
                 modifier = Modifier
@@ -368,14 +390,14 @@ fun MiniPlayerBar(
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         Text(
-                            text = track.artist,
+                            text = prepStatusMessage ?: track.artist,
                             style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            color = if (prepStatusMessage != null) LosslessCyan else MaterialTheme.colorScheme.onSurfaceVariant,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                             modifier = Modifier.weight(1f, fill = false)
                         )
-                        if (signalLabel.isNotBlank()) {
+                        if (signalLabel.isNotBlank() && prepStatusMessage == null) {
                             HiResFormatBadge(
                                 label = track.shortFormatBadge,
                                 isHiRes = isHiRes
@@ -431,6 +453,39 @@ fun MiniPlayerBar(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun MiniPlayerProgressIndicator(
+    positionMsFlow: StateFlow<Long>,
+    durationMs: Long,
+    prepStatusMessage: String?,
+    prepProgress: Float
+) {
+    if (prepStatusMessage != null && prepProgress <= 0f) {
+        LinearProgressIndicator(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(2.dp),
+            color = LosslessCyan,
+            trackColor = HairlineBorder
+        )
+    } else {
+        val positionMs by positionMsFlow.collectAsStateWithLifecycle()
+        val progress = when {
+            prepStatusMessage != null && prepProgress > 0f -> prepProgress.coerceIn(0f, 1f)
+            durationMs > 0L -> (positionMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
+            else -> 0f
+        }
+        LinearProgressIndicator(
+            progress = { progress },
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(2.dp),
+            color = if (prepStatusMessage != null) LosslessCyan else MaterialTheme.colorScheme.primary,
+            trackColor = HairlineBorder
+        )
     }
 }
 

@@ -4,6 +4,7 @@ import android.app.Application
 import coil.ImageLoader
 import coil.ImageLoaderFactory
 import com.example.audio.AudioDspController
+import com.example.audio.EphemeralAudioCacheManager
 import com.example.data.local.AppDatabase
 import com.example.data.local.SettingsDataStore
 import com.example.data.remote.AuthInterceptor
@@ -18,6 +19,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 import okhttp3.logging.HttpLoggingInterceptor
+import java.io.File
 import java.util.concurrent.TimeUnit
 
 class AetherAudioApp : Application(), ImageLoaderFactory {
@@ -33,6 +35,8 @@ class AetherAudioApp : Application(), ImageLoaderFactory {
     lateinit var cloudRepository: CloudMusicRepository
         private set
     lateinit var audioDspController: AudioDspController
+        private set
+    lateinit var ephemeralAudioCacheManager: EphemeralAudioCacheManager
         private set
     lateinit var telemetryBus: PlaybackTelemetryBus
         private set
@@ -55,6 +59,13 @@ class AetherAudioApp : Application(), ImageLoaderFactory {
             .readTimeout(30, TimeUnit.SECONDS)
             .build()
 
+        ephemeralAudioCacheManager = EphemeralAudioCacheManager(
+            tempDir = File(cacheDir, ".aether_tmp"),
+            okHttpClient = okHttpClient
+        ).apply {
+            clearAll()
+        }
+
         database = AppDatabase.getInstance(this)
         settingsDataStore = SettingsDataStore(this)
         cloudRepository = CloudMusicRepository(
@@ -66,7 +77,7 @@ class AetherAudioApp : Application(), ImageLoaderFactory {
 
         audioDspController = AudioDspController()
         telemetryBus = PlaybackTelemetryBus()
-        playbackController = PlaybackController(this)
+        playbackController = PlaybackController(this, ephemeralAudioCacheManager)
 
         sharedImageLoader = ImageLoader.Builder(this)
             .okHttpClient(okHttpClient)

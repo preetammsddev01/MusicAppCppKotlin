@@ -24,6 +24,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.IOException
 import java.net.SocketTimeoutException
+import java.net.URLEncoder
 import java.net.UnknownHostException
 import javax.net.ssl.SSLException
 
@@ -74,32 +75,54 @@ class CloudMusicRepository(
             return@withContext SyncResult.NotConfigured
         }
 
-        val discoveredTracks = LinkedHashMap<String, TrackEntity>()
-
-        // 1. Always include any explicit direct filenames/URLs configured for non-indexed folders
-        AdminServerConfig.directTrackEntries.forEachIndexed { idx, entry ->
-            FlexibleTrackParser.buildTrackFromUrl(
-                rawUrlOrFilename = entry,
-                baseUrl = AdminServerConfig.baseUrl,
-                index = idx
-            )?.let { track ->
-                discoveredTracks.putIfAbsent(track.streamUrl, track)
-            }
-        }
-
-        // 2. Fetch configured catalog endpoint or probe standard manifests under baseUrl
-        val candidateUrls = buildCandidateCatalogUrls()
+        val validationErrors = mutableListOf<String>()
         var lastNetworkError: Exception? = null
         var lastHttpCode: Int? = null
 
-        for (candidateUrl in candidateUrls) {
+        // 1. Validate explicit direct audio filenames/URLs first if configured
+        val directTracks = AdminServerConfig.directTrackEntries
+            .filter { FlexibleTrackParser.isSupportedAudioUrl(it) }
+            .mapIndexedNotNull { idx, entry ->
+                FlexibleTrackParser.buildTrackFromUrl(
+                    rawUrlOrFilename = entry,
+                    baseUrl = AdminServerConfig.baseUrl,
+                    index = idx
+                )
+            }.distinctBy { it.streamUrl }
+
+        if (directTracks.isNotEmpty()) {
+            val validatedDirect = validateStreamUrls(directTracks, validationErrors)
+            if (validatedDirect.isNotEmpty()) {
+                trackDao.replaceCatalogPreservingUserState(validatedDirect)
+                scheduleBackgroundEnrichment()
+                return@withContext SyncResult.Success(validatedDirect.size)
+            }
+        }
+
+        // 2. Check configured endpoint or probe structured manifests before HTML page scraping
+        val candidateEndpoints = buildCandidateCatalogUrls()
+        var htmlFallbackTracks: List<TrackEntity> = emptyList()
+
+        for (candidate in candidateEndpoints) {
             try {
-                val tracks = fetchTracksFromCandidateUrl(candidateUrl)
-                if (tracks.isNotEmpty()) {
-                    tracks.forEach { track ->
-                        discoveredTracks.putIfAbsent(track.streamUrl, track)
+                val result = fetchTracksFromCandidateUrl(
+                    url = candidate.url,
+                    allowHtmlFallback = candidate.allowHtmlFallback
+                )
+                if (result.tracks.isEmpty()) continue
+
+                if (result.fromHtml) {
+                    if (htmlFallbackTracks.isEmpty()) {
+                        htmlFallbackTracks = result.tracks
                     }
-                    break
+                    continue
+                }
+
+                val validated = validateStreamUrls(result.tracks, validationErrors)
+                if (validated.isNotEmpty()) {
+                    trackDao.replaceCatalogPreservingUserState(validated)
+                    scheduleBackgroundEnrichment()
+                    return@withContext SyncResult.Success(validated.size)
                 }
             } catch (e: HttpStatusException) {
                 lastHttpCode = e.code
@@ -108,11 +131,18 @@ class CloudMusicRepository(
             }
         }
 
-        if (discoveredTracks.isNotEmpty()) {
-            val finalTracks = discoveredTracks.values.toList()
-            trackDao.replaceCatalogPreservingUserState(finalTracks)
-            scheduleBackgroundEnrichment()
-            return@withContext SyncResult.Success(finalTracks.size)
+        // 3. Fall back to validating HTML-discovered tracks only if no structured manifest succeeded
+        if (htmlFallbackTracks.isNotEmpty()) {
+            val validatedHtml = validateStreamUrls(htmlFallbackTracks, validationErrors)
+            if (validatedHtml.isNotEmpty()) {
+                trackDao.replaceCatalogPreservingUserState(validatedHtml)
+                scheduleBackgroundEnrichment()
+                return@withContext SyncResult.Success(validatedHtml.size)
+            }
+        }
+
+        if (validationErrors.isNotEmpty()) {
+            return@withContext SyncResult.Failure(formatValidationFailure(validationErrors))
         }
 
         if (lastNetworkError != null) {
@@ -121,19 +151,72 @@ class CloudMusicRepository(
 
         val failureMessage = when (lastHttpCode) {
             401, 403 -> "Stream catalog access denied ($lastHttpCode)."
-            else -> "No track manifest or direct audio URLs found at ${AdminServerConfig.baseUrl}. Host a catalog.json / tracks.txt file there or set AUDIO_SERVER_DIRECT_TRACKS."
+            else -> "No playable audio catalog was found at ${AdminServerConfig.baseUrl}. Host a catalog.json / tracks.txt manifest or direct audio links."
         }
         SyncResult.Failure(failureMessage)
     }
 
-    private fun buildCandidateCatalogUrls(): List<String> {
-        val explicit = AdminServerConfig.resolvedCatalogUrl
-        if (!explicit.isNullOrBlank()) {
-            return listOf(explicit)
-        }
+    private suspend fun validateStreamUrls(
+        tracks: List<TrackEntity>,
+        validationErrors: MutableList<String>
+    ): List<TrackEntity> = coroutineScope {
+        val semaphore = Semaphore(4)
+        tracks.map { track ->
+            async {
+                semaphore.withPermit {
+                    when (val result = StreamUrlResolver.verifyOrResolveAudioUrl(okHttpClient, track.streamUrl)) {
+                        is StreamCheckResult.Playable -> {
+                            if (result.resolvedUrl != track.streamUrl) {
+                                track.copy(streamUrl = result.resolvedUrl)
+                            } else {
+                                track
+                            }
+                        }
+                        is StreamCheckResult.Invalid -> {
+                            synchronized(validationErrors) {
+                                validationErrors.add(result.reason)
+                            }
+                            null
+                        }
+                        is StreamCheckResult.TransientNetworkError -> track
+                    }
+                }
+            }
+        }.awaitAll().filterNotNull()
+    }
+
+    private data class CandidateEndpoint(
+        val url: String,
+        val allowHtmlFallback: Boolean
+    )
+
+    private data class CandidateFetchResult(
+        val tracks: List<TrackEntity>,
+        val fromHtml: Boolean
+    )
+
+    private fun buildCandidateCatalogUrls(): List<CandidateEndpoint> {
         val base = AdminServerConfig.baseUrl
+        val candidates = mutableListOf<CandidateEndpoint>()
+
+        fun addCandidate(url: String?, allowHtmlFallback: Boolean) {
+            val clean = url?.trim()?.takeIf { it.isNotEmpty() } ?: return
+            if (candidates.none { it.url == clean }) {
+                candidates.add(CandidateEndpoint(url = clean, allowHtmlFallback = allowHtmlFallback))
+            }
+        }
+
+        // Folder / public-share URLs placed in AUDIO_SERVER_DIRECT_TRACKS (e.g. https://deepstorage.dev/testappuser)
+        AdminServerConfig.directTrackEntries
+            .filterNot { FlexibleTrackParser.isSupportedAudioUrl(it) }
+            .forEach { entry ->
+                addCandidate(FlexibleTrackParser.resolveUrl(base, entry), allowHtmlFallback = true)
+            }
+
+        addCandidate(AdminServerConfig.resolvedCatalogUrl, allowHtmlFallback = true)
+        addCandidate(base, allowHtmlFallback = true)
+
         val manifestNames = listOf(
-            "",
             "catalog.json",
             "tracks.json",
             "index.json",
@@ -141,17 +224,22 @@ class CloudMusicRepository(
             "playlist.m3u",
             "playlist.m3u8"
         )
-        return manifestNames.mapNotNull { name ->
-            if (name.isEmpty()) base else FlexibleTrackParser.resolveUrl(base, name)
-        }.distinct()
+        manifestNames.forEach { name ->
+            addCandidate(FlexibleTrackParser.resolveUrl(base, name), allowHtmlFallback = false)
+        }
+        return candidates
     }
 
-    private fun fetchTracksFromCandidateUrl(url: String): List<TrackEntity> {
+    private fun fetchTracksFromCandidateUrl(
+        url: String,
+        allowHtmlFallback: Boolean
+    ): CandidateFetchResult {
         // Check if the configured URL itself is a direct audio stream URL
         if (FlexibleTrackParser.isSupportedAudioUrl(url)) {
-            return listOfNotNull(
+            val single = listOfNotNull(
                 FlexibleTrackParser.buildTrackFromUrl(url, AdminServerConfig.baseUrl, 0)
             )
+            return CandidateFetchResult(tracks = single, fromHtml = false)
         }
 
         val request = Request.Builder()
@@ -164,18 +252,104 @@ class CloudMusicRepository(
             if (!response.isSuccessful) {
                 throw HttpStatusException(response.code)
             }
+            val effectiveUrl = response.request.url.toString()
             val contentType = response.header("Content-Type").orEmpty()
-            if (contentType.startsWith("audio/", ignoreCase = true)) {
-                return listOfNotNull(
-                    FlexibleTrackParser.buildTrackFromUrl(url, AdminServerConfig.baseUrl, 0)
+            if (StreamUrlResolver.isAudioMimeType(contentType)) {
+                val single = listOfNotNull(
+                    FlexibleTrackParser.buildTrackFromUrl(effectiveUrl, AdminServerConfig.baseUrl, 0)
                 )
+                return CandidateFetchResult(tracks = single, fromHtml = false)
             }
             val body = response.body?.string().orEmpty()
-            return FlexibleTrackParser.parseCatalogPayload(
+            val deepStorageShare = FlexibleTrackParser.extractDeepStoragePublicShareInfo(body, effectiveUrl)
+            if (deepStorageShare != null) {
+                val shareTracks = fetchDeepStoragePublicShareTracks(deepStorageShare)
+                return CandidateFetchResult(tracks = shareTracks, fromHtml = false)
+            }
+
+            val parsed = FlexibleTrackParser.parseCatalogPayload(
                 rawPayload = body,
                 contentType = contentType,
-                baseUrl = AdminServerConfig.baseUrl
+                baseUrl = effectiveUrl,
+                allowHtmlFallback = allowHtmlFallback
             )
+            val isHtmlResponse = contentType.contains("html", ignoreCase = true) ||
+                body.trimStart().startsWith("<!doctype", ignoreCase = true) ||
+                body.trimStart().startsWith("<html", ignoreCase = true)
+            return CandidateFetchResult(tracks = parsed, fromHtml = isHtmlResponse)
+        }
+    }
+
+    private fun fetchDeepStoragePublicShareTracks(shareInfo: DeepStorageShareInfo): List<TrackEntity> {
+        val collected = LinkedHashMap<String, TrackEntity>()
+        val pendingFolders = ArrayDeque<String>()
+        val visitedFolders = HashSet<String>()
+        pendingFolders.add("")
+        visitedFolders.add("")
+
+        val encodedUsername = URLEncoder.encode(shareInfo.username, "UTF-8").replace("+", "%20")
+
+        while (pendingFolders.isNotEmpty() && visitedFolders.size <= 30 && collected.size < 500) {
+            val relPath = pendingFolders.removeFirst()
+            var offset = 0
+            var pageCount = 0
+
+            while (pageCount < 20 && collected.size < 500) {
+                val encodedPath = URLEncoder.encode(relPath, "UTF-8").replace("+", "%20")
+                val apiUrl = "${shareInfo.apiOrigin}/public/api/files/$encodedUsername?path=$encodedPath&offset=$offset&sort=date_desc"
+                val apiReq = Request.Builder()
+                    .url(apiUrl)
+                    .get()
+                    .header("Accept", "application/json")
+                    .build()
+
+                val pageJson = okHttpClient.newCall(apiReq).execute().use { apiResp ->
+                    if (!apiResp.isSuccessful) break
+                    apiResp.body?.string().orEmpty()
+                }
+                if (pageJson.isBlank()) break
+
+                val page = runCatching {
+                    FlexibleTrackParser.parseDeepStorageFilesPage(pageJson, shareInfo.apiOrigin)
+                }.getOrNull() ?: break
+
+                page.tracks.forEach { track ->
+                    collected.putIfAbsent(track.streamUrl, track)
+                }
+
+                if (pageCount == 0) {
+                    page.folders.forEach { folderName ->
+                        val cleanName = folderName.trim('/')
+                        if (cleanName.isNotEmpty() && !cleanName.contains("..")) {
+                            val childPath = "$relPath$cleanName/"
+                            if (visitedFolders.size < 30 && visitedFolders.add(childPath)) {
+                                pendingFolders.add(childPath)
+                            }
+                        }
+                    }
+                }
+
+                if (!page.hasMore || page.nextOffset <= offset) break
+                offset = page.nextOffset
+                pageCount++
+            }
+        }
+
+        return collected.values.toList()
+    }
+
+    private fun formatValidationFailure(errors: List<String>): String {
+        val first = errors.firstOrNull().orEmpty()
+        return when {
+            first.contains("text/html", ignoreCase = true) ||
+                first.contains("HTML/text", ignoreCase = true) ->
+                "The streaming URL opened a web share page rather than direct audio files. Host a catalog.json / tracks.txt manifest or direct audio links."
+            first.contains("Access denied", ignoreCase = true) ->
+                "Access to the streaming audio files was denied by the server."
+            first.contains("not found", ignoreCase = true) ->
+                "The listed audio files could not be found on the streaming server."
+            first.isNotBlank() -> first
+            else -> "No playable audio streams were found at ${AdminServerConfig.baseUrl}."
         }
     }
 
@@ -184,12 +358,23 @@ class CloudMusicRepository(
         enrichmentJob = enrichmentScope.launch {
             val pending = trackDao.getUnenrichedTracksOnce()
             if (pending.isEmpty()) return@launch
-            val semaphore = Semaphore(3)
+            val semaphore = Semaphore(1)
             coroutineScope {
                 pending.map { track ->
                     async {
                         semaphore.withPermit {
-                            val enriched = metadataExtractor.extractFromStream(track)
+                            val prevPriority = runCatching {
+                                val p = android.os.Process.getThreadPriority(android.os.Process.myTid())
+                                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+                                p
+                            }.getOrNull()
+                            val enriched = try {
+                                metadataExtractor.extractFromStream(track)
+                            } finally {
+                                if (prevPriority != null) {
+                                    runCatching { android.os.Process.setThreadPriority(prevPriority) }
+                                }
+                            }
                             if (enriched != null) {
                                 trackDao.updateEnrichedMetadata(
                                     trackId = track.id,
@@ -244,13 +429,16 @@ class CloudMusicRepository(
         } else {
             null
         }
-        val cleanTitle = title?.trim()?.takeIf { it.isNotEmpty() }
-        val cleanArtist = artist?.trim()?.takeIf { it.isNotEmpty() }
-        val cleanAlbum = album?.trim()?.takeIf { it.isNotEmpty() }
-        val cleanGenre = genre?.trim()?.takeIf { it.isNotEmpty() }
+        val cleanTitle = title?.trim()?.takeIf { it.isNotEmpty() && it != existing.title }
+        val cleanArtist = artist?.trim()?.takeIf { it.isNotEmpty() && it != existing.artist }
+        val cleanAlbum = album?.trim()?.takeIf { it.isNotEmpty() && it != existing.album }
+        val cleanGenre = genre?.trim()?.takeIf { it.isNotEmpty() && it != existing.genre }
+        val newSampleRate = if (sampleRateHz > 0 && sampleRateHz != existing.sampleRateHz) sampleRateHz else 0
+        val newBitDepth = if (bitDepth > 0 && bitDepth != existing.bitDepth) bitDepth else 0
+        val newBitrate = if (bitrateKbps > 0 && bitrateKbps != existing.bitrateKbps) bitrateKbps else 0
 
         if (cleanTitle != null || cleanArtist != null || cleanAlbum != null ||
-            cleanGenre != null || cachedArtUri != null || sampleRateHz > 0 || bitDepth > 0 || bitrateKbps > 0
+            cleanGenre != null || cachedArtUri != null || newSampleRate > 0 || newBitDepth > 0 || newBitrate > 0
         ) {
             trackDao.updateEnrichedMetadata(
                 trackId = trackId,
@@ -260,9 +448,9 @@ class CloudMusicRepository(
                 genre = cleanGenre,
                 albumArtUrl = cachedArtUri,
                 durationMs = 0L,
-                sampleRateHz = sampleRateHz,
-                bitDepth = bitDepth,
-                bitrateKbps = bitrateKbps,
+                sampleRateHz = newSampleRate,
+                bitDepth = newBitDepth,
+                bitrateKbps = newBitrate,
                 trackNumber = 0
             )
         }

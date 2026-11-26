@@ -67,8 +67,15 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.media3.common.Player
+import kotlinx.coroutines.flow.StateFlow
 import com.example.R
+import com.example.audio.TempPrepStatus
+import com.example.audio.TempTrackState
+import com.example.data.model.BuiltInEqPresets
+import com.example.data.model.EqualizerPreset
+import com.example.data.model.EqualizerState
 import com.example.data.model.TrackEntity
 import com.example.ui.components.AlbumArtworkImage
 import com.example.ui.components.HiResFormatBadge
@@ -87,9 +94,9 @@ import com.example.ui.viewmodel.PlaybackUiState
 @Composable
 fun NowPlayingOverlay(
     playbackState: PlaybackUiState,
-    isDspEnabled: Boolean,
-    isNativeCppEngine: Boolean = false,
-    isBitExactBypass: Boolean = !isDspEnabled,
+    positionMsFlow: StateFlow<Long>,
+    eqState: EqualizerState,
+    onSelectEqPreset: (EqualizerPreset) -> Unit,
     onCollapse: () -> Unit,
     onToggleLike: () -> Unit,
     onAddToPlaylist: (TrackEntity) -> Unit,
@@ -105,14 +112,15 @@ fun NowPlayingOverlay(
 ) {
     BackHandler { onCollapse() }
 
+    val isDspEnabled = eqState.isDspEnabled
+    val isNativeCppEngine = eqState.isNativeCppEngine
+    val isBitExactBypass = eqState.isBitExactBypass
+    val activePresetName = BuiltInEqPresets.findById(eqState.selectedPresetId, eqState.customPresets)?.name
+        ?: if (eqState.selectedPresetId == "custom") "Custom" else "Flat"
+
     val track = playbackState.currentTrack ?: return
     var showQueueSheet by remember { mutableStateOf(false) }
-
-    var isSeeking by remember { mutableStateOf(false) }
-    var dragPositionMs by remember { mutableFloatStateOf(0f) }
-
-    val displayPositionMs = if (isSeeking) dragPositionMs.toLong() else playbackState.positionMs
-    val totalMs = playbackState.durationMs.coerceAtLeast(1L)
+    var showPresetSheet by remember { mutableStateOf(false) }
 
     Box(
         modifier = Modifier
@@ -275,11 +283,18 @@ fun NowPlayingOverlay(
                         modifier = Modifier.size(16.dp)
                     )
                     Text(
-                        text = playbackState.signalDisplayLabel.ifBlank { track.detailedSignalLabel },
+                        text = playbackState.prepStatusMessage
+                            ?: playbackState.signalDisplayLabel.ifBlank { track.detailedSignalLabel },
                         style = TelemetryTextStyle,
-                        color = if (playbackState.isHiResSignal) LosslessCyan else MaterialTheme.colorScheme.onSurface
+                        color = if (playbackState.isHiResSignal || playbackState.isPreparingAudio) {
+                            LosslessCyan
+                        } else {
+                            MaterialTheme.colorScheme.onSurface
+                        }
                     )
                     val pathSuffix = when {
+                        playbackState.isPreparingAudio -> "· TEMP CACHE"
+                        playbackState.currentPrepState?.convertedToWav == true -> "· PCM WAV"
                         isBitExactBypass || !isDspEnabled -> "· BIT-EXACT"
                         isNativeCppEngine -> "· C++ DSP"
                         else -> "· DSP"
@@ -314,44 +329,12 @@ fun NowPlayingOverlay(
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            // Precision Scrubber
-            Column(modifier = Modifier.fillMaxWidth()) {
-                Slider(
-                    value = displayPositionMs.toFloat().coerceIn(0f, totalMs.toFloat()),
-                    onValueChange = {
-                        isSeeking = true
-                        dragPositionMs = it
-                    },
-                    onValueChangeFinished = {
-                        onSeekTo(dragPositionMs.toLong())
-                        isSeeking = false
-                    },
-                    valueRange = 0f..totalMs.toFloat(),
-                    colors = SliderDefaults.colors(
-                        thumbColor = MaterialTheme.colorScheme.primary,
-                        activeTrackColor = MaterialTheme.colorScheme.primary,
-                        inactiveTrackColor = HairlineBorder
-                    ),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .testTag("now_playing_seek_slider")
-                )
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Text(
-                        text = formatDurationMs(displayPositionMs),
-                        style = TelemetryTextStyle,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Text(
-                        text = formatDurationMs(playbackState.durationMs),
-                        style = TelemetryTextStyle,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            }
+            // Precision Scrubber (isolated so 250ms ticks do not recompose the full overlay)
+            NowPlayingScrubber(
+                positionMsFlow = positionMsFlow,
+                durationMs = playbackState.durationMs,
+                onSeekTo = onSeekTo
+            )
 
             Spacer(modifier = Modifier.height(12.dp))
 
@@ -458,8 +441,37 @@ fun NowPlayingOverlay(
             // Bottom Utility Actions
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.Center
+                horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.CenterHorizontally)
             ) {
+                Surface(
+                    shape = RoundedCornerShape(14.dp),
+                    color = StudioConsole,
+                    border = BorderStroke(
+                        1.dp,
+                        if (isDspEnabled && !isBitExactBypass) MaterialTheme.colorScheme.primary.copy(alpha = 0.5f) else HairlineBorder
+                    ),
+                    modifier = Modifier
+                        .testTag("open_quick_presets_button")
+                        .clickable { showPresetSheet = true }
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(7.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Equalizer,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp),
+                            tint = if (isDspEnabled && !isBitExactBypass) MaterialTheme.colorScheme.primary else VerifiedEmerald
+                        )
+                        Text(
+                            text = "EQ · $activePresetName",
+                            style = MaterialTheme.typography.labelLarge
+                        )
+                    }
+                }
+
                 Surface(
                     shape = RoundedCornerShape(14.dp),
                     color = StudioConsole,
@@ -469,9 +481,9 @@ fun NowPlayingOverlay(
                         .clickable { showQueueSheet = true }
                 ) {
                     Row(
-                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        horizontalArrangement = Arrangement.spacedBy(7.dp)
                     ) {
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.QueueMusic,
@@ -489,10 +501,27 @@ fun NowPlayingOverlay(
         }
     }
 
+    if (showPresetSheet) {
+        QuickDspPresetSheet(
+            eqState = eqState,
+            onSelectPreset = { preset ->
+                onSelectEqPreset(preset)
+                showPresetSheet = false
+            },
+            onOpenFullEqualizer = {
+                showPresetSheet = false
+                onOpenEqualizer()
+            },
+            onDismiss = { showPresetSheet = false }
+        )
+    }
+
     if (showQueueSheet) {
         UpNextQueueSheet(
             queue = playbackState.queue,
             currentIndex = playbackState.currentQueueIndex,
+            queuePrepStates = playbackState.queuePrepStates,
+            cachedQueueCount = playbackState.cachedQueueCount,
             onSelectIndex = { idx ->
                 onSelectQueueIndex(idx)
                 showQueueSheet = false
@@ -507,6 +536,8 @@ fun NowPlayingOverlay(
 private fun UpNextQueueSheet(
     queue: List<TrackEntity>,
     currentIndex: Int,
+    queuePrepStates: Map<String, TempTrackState>,
+    cachedQueueCount: Int,
     onSelectIndex: (Int) -> Unit,
     onDismiss: () -> Unit
 ) {
@@ -523,11 +554,23 @@ private fun UpNextQueueSheet(
                 .navigationBarsPadding()
                 .padding(horizontal = 16.dp)
         ) {
-            Text(
-                text = "Playback Queue",
-                style = MaterialTheme.typography.titleLarge,
-                modifier = Modifier.padding(bottom = 12.dp)
-            )
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 12.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "Playback Queue",
+                    style = MaterialTheme.typography.titleLarge
+                )
+                Text(
+                    text = "$cachedQueueCount/${queue.size} TEMP READY",
+                    style = TelemetryTextStyle,
+                    color = if (cachedQueueCount == queue.size && queue.isNotEmpty()) VerifiedEmerald else LosslessCyan
+                )
+            }
             LazyColumn(
                 contentPadding = PaddingValues(bottom = 24.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -535,6 +578,7 @@ private fun UpNextQueueSheet(
             ) {
                 itemsIndexed(queue) { index, item ->
                     val isCurrent = index == currentIndex
+                    val prep = queuePrepStates[item.id]
                     Surface(
                         shape = RoundedCornerShape(10.dp),
                         color = if (isCurrent) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.25f) else TonalRack,
@@ -572,16 +616,34 @@ private fun UpNextQueueSheet(
                                     overflow = TextOverflow.Ellipsis
                                 )
                                 Text(
-                                    text = item.artist,
+                                    text = when (prep?.status) {
+                                        TempPrepStatus.DOWNLOADING -> "Downloading to temp cache..."
+                                        TempPrepStatus.CONVERTING -> "Converting to PCM WAV..."
+                                        TempPrepStatus.FAILED -> prep.errorMessage ?: "Download failed"
+                                        else -> item.artist
+                                    },
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    color = when (prep?.status) {
+                                        TempPrepStatus.DOWNLOADING, TempPrepStatus.CONVERTING -> LosslessCyan
+                                        TempPrepStatus.FAILED -> ErrorCoral
+                                        else -> MaterialTheme.colorScheme.onSurfaceVariant
+                                    },
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis
                                 )
                             }
+                            if (prep?.status == TempPrepStatus.DOWNLOADING || prep?.status == TempPrepStatus.CONVERTING) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier
+                                        .padding(end = 8.dp)
+                                        .size(16.dp),
+                                    strokeWidth = 2.dp,
+                                    color = LosslessCyan
+                                )
+                            }
                             HiResFormatBadge(
-                                label = item.shortFormatBadge,
-                                isHiRes = item.isHiRes
+                                label = if (prep?.convertedToWav == true) "PCM WAV" else item.shortFormatBadge,
+                                isHiRes = item.isHiRes || prep?.convertedToWav == true
                             )
                         }
                     }
@@ -590,3 +652,179 @@ private fun UpNextQueueSheet(
         }
     }
 }
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun QuickDspPresetSheet(
+    eqState: EqualizerState,
+    onSelectPreset: (EqualizerPreset) -> Unit,
+    onOpenFullEqualizer: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val allPresets = BuiltInEqPresets.all + eqState.customPresets
+
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+        containerColor = StudioConsole,
+        contentWindowInsets = { WindowInsets(0) }
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .navigationBarsPadding()
+                .padding(horizontal = 16.dp)
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 12.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column {
+                    Text(
+                        text = "C++ DSP Presets",
+                        style = MaterialTheme.typography.titleLarge
+                    )
+                    Text(
+                        text = if (eqState.isNativeCppEngine) "64-Bit Native 10-Band Engine" else "10-Band Equalizer Profiles",
+                        style = TelemetryTextStyle,
+                        color = LosslessCyan
+                    )
+                }
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.25f),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.5f)),
+                    modifier = Modifier
+                        .testTag("quick_sheet_open_studio")
+                        .clickable(onClick = onOpenFullEqualizer)
+                ) {
+                    Text(
+                        text = "10-Band Studio",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                    )
+                }
+            }
+
+            LazyColumn(
+                contentPadding = PaddingValues(bottom = 24.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.height(360.dp)
+            ) {
+                itemsIndexed(allPresets) { _, preset ->
+                    val isSelected = eqState.selectedPresetId == preset.id
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = if (isSelected) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.28f) else TonalRack,
+                        border = BorderStroke(
+                            1.dp,
+                            if (isSelected) MaterialTheme.colorScheme.primary else HairlineBorder
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("quick_eq_preset_${preset.id}")
+                            .clickable { onSelectPreset(preset) }
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Text(
+                                        text = preset.name,
+                                        style = MaterialTheme.typography.titleSmall,
+                                        color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
+                                    )
+                                    Text(
+                                        text = if (preset.isBuiltIn) preset.category.uppercase() else "CUSTOM",
+                                        style = TelemetryTextStyle,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                                if (preset.description.isNotBlank()) {
+                                    Text(
+                                        text = preset.description,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                            }
+                            val bassPct = (preset.bassBoost / 10).coerceIn(0, 100)
+                            val spacePct = (preset.virtualizer / 10).coerceIn(0, 100)
+                            HiResFormatBadge(
+                                label = if (bassPct == 0 && spacePct == 0 && preset.id == "flat") "BIT-EXACT"
+                                else "B $bassPct% · S $spacePct%",
+                                isHiRes = isSelected
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun NowPlayingScrubber(
+    positionMsFlow: StateFlow<Long>,
+    durationMs: Long,
+    onSeekTo: (Long) -> Unit
+) {
+    val positionMs by positionMsFlow.collectAsStateWithLifecycle()
+    var isSeeking by remember { mutableStateOf(false) }
+    var dragPositionMs by remember { mutableFloatStateOf(0f) }
+
+    val displayPositionMs = if (isSeeking) dragPositionMs.toLong() else positionMs
+    val totalMs = durationMs.coerceAtLeast(1L)
+
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Slider(
+            value = displayPositionMs.toFloat().coerceIn(0f, totalMs.toFloat()),
+            onValueChange = {
+                isSeeking = true
+                dragPositionMs = it
+            },
+            onValueChangeFinished = {
+                onSeekTo(dragPositionMs.toLong())
+                isSeeking = false
+            },
+            valueRange = 0f..totalMs.toFloat(),
+            colors = SliderDefaults.colors(
+                thumbColor = MaterialTheme.colorScheme.primary,
+                activeTrackColor = MaterialTheme.colorScheme.primary,
+                inactiveTrackColor = HairlineBorder
+            ),
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("now_playing_seek_slider")
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text(
+                text = formatDurationMs(displayPositionMs),
+                style = TelemetryTextStyle,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text(
+                text = formatDurationMs(durationMs),
+                style = TelemetryTextStyle,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+}
+

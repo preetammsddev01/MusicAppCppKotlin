@@ -5,6 +5,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.os.Build
 import androidx.annotation.OptIn
 import androidx.media3.common.AudioAttributes
@@ -14,12 +15,15 @@ import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultDataSource
+import androidx.media3.datasource.ResolvingDataSource
 import androidx.media3.datasource.okhttp.OkHttpDataSource
+import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioSink
+import androidx.media3.exoplayer.audio.DefaultAudioTrackBufferSizeProvider
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.extractor.DefaultExtractorsFactory
 import androidx.media3.session.DefaultMediaNotificationProvider
@@ -28,6 +32,7 @@ import androidx.media3.session.MediaSessionService
 import com.example.AetherAudioApp
 import com.example.MainActivity
 import com.example.R
+import com.example.data.remote.AudioStreamGuardInterceptor
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -46,10 +51,42 @@ class PlaybackService : MediaSessionService() {
         ensureNotificationChannel()
 
         val app = application as AetherAudioApp
-        val okHttpDataSourceFactory = OkHttpDataSource.Factory(app.okHttpClient)
-        val dataSourceFactory = DefaultDataSource.Factory(this, okHttpDataSourceFactory)
+        val playbackHttpClient = app.okHttpClient.newBuilder()
+            .addInterceptor(AudioStreamGuardInterceptor())
+            .build()
+        val okHttpDataSourceFactory = OkHttpDataSource.Factory(playbackHttpClient)
+        val baseDataSourceFactory = DefaultDataSource.Factory(this, okHttpDataSourceFactory)
+        val dataSourceFactory = ResolvingDataSource.Factory(baseDataSourceFactory) { dataSpec ->
+            val scheme = dataSpec.uri.scheme
+            if (scheme == "http" || scheme == "https") {
+                val localUri = app.ephemeralAudioCacheManager.getReadyLocalUriForUrl(dataSpec.uri.toString())
+                if (localUri != null) {
+                    dataSpec.buildUpon().setUri(Uri.parse(localUri)).build()
+                } else {
+                    dataSpec
+                }
+            } else {
+                dataSpec
+            }
+        }
         val extractorsFactory = DefaultExtractorsFactory()
             .setConstantBitrateSeekingEnabled(true)
+
+        val audioTrackBufferSizeProvider = DefaultAudioTrackBufferSizeProvider.Builder()
+            .setMinPcmBufferDurationUs(250_000)
+            .setMaxPcmBufferDurationUs(500_000)
+            .setPcmBufferMultiplicationFactor(2)
+            .build()
+
+        val loadControl = DefaultLoadControl.Builder()
+            .setBufferDurationsMs(
+                8_000, // minBufferMs
+                20_000, // maxBufferMs
+                250,    // bufferForPlaybackMs
+                500     // bufferForPlaybackAfterRebufferMs
+            )
+            .setBackBuffer(0, false)
+            .build()
 
         val renderersFactory = object : DefaultRenderersFactory(this) {
             override fun buildAudioSink(
@@ -60,6 +97,7 @@ class PlaybackService : MediaSessionService() {
                 return DefaultAudioSink.Builder(context)
                     .setEnableFloatOutput(true)
                     .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
+                    .setAudioTrackBufferSizeProvider(audioTrackBufferSizeProvider)
                     .setAudioProcessors(arrayOf(app.audioDspController.nativeAudioProcessor))
                     .build()
             }
@@ -72,6 +110,7 @@ class PlaybackService : MediaSessionService() {
 
         val player = ExoPlayer.Builder(this, renderersFactory)
             .setMediaSourceFactory(DefaultMediaSourceFactory(dataSourceFactory, extractorsFactory))
+            .setLoadControl(loadControl)
             .setAudioAttributes(audioAttributes, true)
             .setHandleAudioBecomingNoisy(true)
             .setWakeMode(C.WAKE_MODE_NETWORK)
@@ -165,22 +204,31 @@ class PlaybackService : MediaSessionService() {
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
-        val player = mediaSession?.player
-        if (player == null || !player.playWhenReady || player.mediaItemCount == 0) {
-            stopSelf()
+        val app = application as AetherAudioApp
+        app.playbackController.cancelAllPreparation()
+        mediaSession?.player?.let { player ->
+            player.stop()
+            player.clearMediaItems()
         }
+        app.ephemeralAudioCacheManager.clearAll()
+        stopSelf()
+        super.onTaskRemoved(rootIntent)
     }
 
     override fun onDestroy() {
         serviceScope.cancel()
         val app = application as AetherAudioApp
+        app.playbackController.cancelAllPreparation()
         app.audioDspController.releaseEffects()
         mediaSession?.run {
+            player.stop()
+            player.clearMediaItems()
             player.release()
             release()
         }
         mediaSession = null
         exoPlayer = null
+        app.ephemeralAudioCacheManager.clearAll()
         super.onDestroy()
     }
 

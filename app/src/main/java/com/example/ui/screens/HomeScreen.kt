@@ -43,6 +43,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.R
@@ -144,6 +145,17 @@ fun HomeScreen(
             }
         }
 
+        if (uiState.totalTrackCount == 0 && !uiState.isSyncing) {
+            item(key = "home_unavailable_state") {
+                StreamUnavailableCard(
+                    isConfigured = uiState.isServerConfigured,
+                    errorMessage = uiState.syncError,
+                    onRetry = onRefresh
+                )
+            }
+            return@LazyColumn
+        }
+
         uiState.syncError?.let { err ->
             item(key = "home_sync_error") {
                 Surface(
@@ -162,16 +174,6 @@ fun HomeScreen(
                     )
                 }
             }
-        }
-
-        if (uiState.totalTrackCount == 0 && !uiState.isSyncing) {
-            item(key = "home_unavailable_state") {
-                StreamUnavailableCard(
-                    isConfigured = uiState.isServerConfigured,
-                    onRetry = onRefresh
-                )
-            }
-            return@LazyColumn
         }
 
         // Featured Hi-Res Hero Banner
@@ -567,6 +569,7 @@ private fun AlbumShelfCard(
 @Composable
 private fun StreamUnavailableCard(
     isConfigured: Boolean,
+    errorMessage: String?,
     onRetry: () -> Unit
 ) {
     Surface(
@@ -588,17 +591,19 @@ private fun StreamUnavailableCard(
             Spacer(modifier = Modifier.height(12.dp))
             Text(
                 text = stringResource(R.string.catalog_unavailable_title),
-                style = MaterialTheme.typography.titleLarge
+                style = MaterialTheme.typography.titleLarge,
+                textAlign = TextAlign.Center
             )
             Spacer(modifier = Modifier.height(6.dp))
             Text(
-                text = if (!isConfigured) {
-                    stringResource(R.string.catalog_unavailable_subtitle)
-                } else {
-                    "Could not reach the streaming catalog. Check your internet connection and retry."
+                text = when {
+                    !isConfigured -> stringResource(R.string.catalog_unavailable_subtitle)
+                    !errorMessage.isNullOrBlank() -> errorMessage
+                    else -> "Could not reach the streaming catalog. Check your internet connection and retry."
                 },
                 style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center
             )
             Spacer(modifier = Modifier.height(16.dp))
             Button(

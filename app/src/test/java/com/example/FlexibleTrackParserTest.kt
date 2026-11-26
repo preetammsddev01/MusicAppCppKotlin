@@ -185,4 +185,158 @@ class FlexibleTrackParserTest {
         assertEquals("http://192.168.1.50:8080/files/aja.flac", tracks[0].streamUrl)
         assertTrue(tracks[0].isHiRes)
     }
+
+    @Test
+    fun `does not double subpath and unescapes HTML entities and embedded script audio URLs`() {
+        val base = "https://deepstorage.dev/testappuser"
+        assertEquals(
+            "https://deepstorage.dev/testappuser/song.flac",
+            FlexibleTrackParser.resolveUrl(base, "/testappuser/song.flac")
+        )
+
+        val htmlWithRootPathsAndEntities = """
+            <html><body>
+              <a href="/testappuser/01%20-%20Miles%20Davis%20-%20So%20What.flac?download=1&amp;v=2">Track 1</a>
+              <a href="/api/raw/track2.mp3">Track 2</a>
+              <audio src="/media/track3.ogg"></audio>
+              <a href="/testappuser/unsupported.dsf">Unsupported DSD</a>
+            </body></html>
+        """.trimIndent()
+        val htmlTracks = FlexibleTrackParser.parseCatalogPayload(htmlWithRootPathsAndEntities, "text/html", base)
+        assertEquals(3, htmlTracks.size)
+        assertEquals(
+            "https://deepstorage.dev/testappuser/01%20-%20Miles%20Davis%20-%20So%20What.flac?download=1&v=2",
+            htmlTracks[0].streamUrl
+        )
+        assertEquals("https://deepstorage.dev/api/raw/track2.mp3", htmlTracks[1].streamUrl)
+        assertEquals("https://deepstorage.dev/media/track3.ogg", htmlTracks[2].streamUrl)
+
+        val spaHtml = """
+            <!DOCTYPE html>
+            <html><body>
+              <div id="__next"></div>
+              <script id="__NEXT_DATA__" type="application/json">
+                {"props":{"files":["https:\/\/deepstorage.dev\/testappuser\/embedded_track.flac?token=1\u0026raw=1"]}}
+              </script>
+            </body></html>
+        """.trimIndent()
+        val spaTracks = FlexibleTrackParser.parseCatalogPayload(spaHtml, "text/html", base)
+        assertEquals(1, spaTracks.size)
+        assertEquals(
+            "https://deepstorage.dev/testappuser/embedded_track.flac?token=1&raw=1",
+            spaTracks[0].streamUrl
+        )
+
+        val xmlError = """<?xml version="1.0"?><Error><Code>AccessDenied</Code><Message>bad.flac</Message></Error>"""
+        val xmlTracks = FlexibleTrackParser.parseCatalogPayload(xmlError, "application/xml", base)
+        assertTrue(xmlTracks.isEmpty())
+    }
+
+    @Test
+    fun `ignores SPA HTML when allowHtmlFallback is false and extracts download-attr or script JSON tracks`() {
+        val base = "https://share.deepstorage.dev/testappuser"
+        val spaShell = """<!DOCTYPE html><html><body><a href="/testappuser/fake.flac">fake</a></body></html>"""
+
+        assertTrue(
+            FlexibleTrackParser.parseCatalogPayload(
+                rawPayload = spaShell,
+                contentType = "text/html; charset=utf-8",
+                baseUrl = base,
+                allowHtmlFallback = false
+            ).isEmpty()
+        )
+
+        val downloadAttrHtml = """
+            <html><body>
+              <a href="/api/v1/download/abc123" download="01 - Massive Attack - Teardrop.flac">Download</a>
+            </body></html>
+        """.trimIndent()
+        val attrTracks = FlexibleTrackParser.parseCatalogPayload(downloadAttrHtml, "text/html", base)
+        assertEquals(1, attrTracks.size)
+        assertEquals("https://share.deepstorage.dev/api/v1/download/abc123", attrTracks[0].streamUrl)
+        assertEquals("Massive Attack", attrTracks[0].artist)
+        assertEquals("Teardrop", attrTracks[0].title)
+        assertEquals("FLAC", attrTracks[0].format)
+
+        val hydratedJsonHtml = """
+            <html><body>
+              <script id="__NEXT_DATA__" type="application/json">
+                {"props":{"files":[{"id":"f1","name":"Miles Davis - Blue in Green.flac","downloadUrl":"https://cdn.deepstorage.dev/blob/f1"}]}}
+              </script>
+            </body></html>
+        """.trimIndent()
+        val jsonTracks = FlexibleTrackParser.parseCatalogPayload(hydratedJsonHtml, "text/html", base)
+        assertEquals(1, jsonTracks.size)
+        assertEquals("https://cdn.deepstorage.dev/blob/f1", jsonTracks[0].streamUrl)
+        assertEquals("FLAC", jsonTracks[0].format)
+    }
+
+    @Test
+    fun `detects DeepStorage public share HTML and parses files, folders, and pagination`() {
+        val shareHtml = """
+            <!DOCTYPE html>
+            <html><body>
+              <div id="fileGrid"></div>
+              <script>const PAGE_USERNAME = "testappuser";</script>
+              <script src="/assets/public_page.js?v=5"></script>
+            </body></html>
+        """.trimIndent()
+
+        val shareInfo = FlexibleTrackParser.extractDeepStoragePublicShareInfo(
+            html = shareHtml,
+            pageUrl = "https://share.deepstorage.dev/testappuser"
+        )
+        assertEquals("https://share.deepstorage.dev", shareInfo?.apiOrigin)
+        assertEquals("testappuser", shareInfo?.username)
+
+        val apiJson = """
+            {
+              "files": [
+                {
+                  "_id": "6b07351a6e490c34bb1b8ee3",
+                  "username": "testappuser",
+                  "file_link": "https://share.deepstorage.dev/2faa2511/Tera%20Mera%20Rishta%20-%20Rain%20Version%20%5B320%5D.mp3",
+                  "folder_path": "/Shareable Folder/",
+                  "file_name": "Tera Mera Rishta - Rain Version [320].mp3",
+                  "file_size": 15034751
+                },
+                {
+                  "_id": "keep-file",
+                  "file_link": "https://share.deepstorage.dev/abc/.keep",
+                  "folder_path": "/Shareable Folder/",
+                  "file_name": ".keep"
+                },
+                {
+                  "_id": "cover-img",
+                  "file_link": "https://share.deepstorage.dev/def/cover.jpg",
+                  "folder_path": "/Shareable Folder/Live Sessions/",
+                  "file_name": "cover.jpg"
+                },
+                {
+                  "_id": "flac-2",
+                  "file_link": "https://share.deepstorage.dev/ghi/01%20-%20So%20What.flac",
+                  "folder_path": "/Shareable Folder/Live Sessions/",
+                  "file_name": "01 - So What.flac"
+                }
+              ],
+              "folders": ["Live Sessions", "HiRes"],
+              "next_offset": 4,
+              "has_more": true
+            }
+        """.trimIndent()
+
+        val page = FlexibleTrackParser.parseDeepStorageFilesPage(apiJson, "https://share.deepstorage.dev")
+        assertEquals(2, page.tracks.size)
+        assertEquals("MP3", page.tracks[0].format)
+        assertEquals(
+            "https://share.deepstorage.dev/2faa2511/Tera%20Mera%20Rishta%20-%20Rain%20Version%20%5B320%5D.mp3",
+            page.tracks[0].streamUrl
+        )
+        assertEquals("FLAC", page.tracks[1].format)
+        assertEquals("Live Sessions", page.tracks[1].album)
+        assertEquals(listOf("Live Sessions", "HiRes"), page.folders)
+        assertTrue(page.hasMore)
+        assertEquals(4, page.nextOffset)
+    }
 }
+

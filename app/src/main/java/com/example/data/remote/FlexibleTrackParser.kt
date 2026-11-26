@@ -15,14 +15,65 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import java.net.URLDecoder
 import java.security.MessageDigest
 
+data class DeepStorageShareInfo(
+    val apiOrigin: String,
+    val username: String
+)
+
+data class DeepStorageFilesPage(
+    val tracks: List<TrackEntity>,
+    val folders: List<String>,
+    val hasMore: Boolean,
+    val nextOffset: Int
+)
+
 object FlexibleTrackParser {
 
+    // Extensions playable directly or via AudioByteConverter temp PCM WAV conversion
     private val AUDIO_EXTENSIONS = setOf(
-        "flac", "wav", "alac", "m4a", "aiff", "aif", "opus", "ogg", "mp3", "aac", "dsf", "dff", "wv", "ape"
+        "flac", "wav", "alac", "m4a", "mp4", "aiff", "aif", "opus", "ogg", "oga", "mp3", "aac", "adts", "webm", "mka", "mkv", "ts", "flv", "amr", "ac3", "ec3"
+    )
+
+    private val STRICT_AUDIO_EXTENSIONS = setOf(
+        "flac", "wav", "alac", "m4a", "aiff", "aif", "opus", "ogg", "oga", "mp3", "aac", "adts", "mka", "amr", "ac3", "ec3"
+    )
+
+    private val DEEPSTORAGE_PAGE_USERNAME_REGEX = Regex(
+        """PAGE_USERNAME\s*=\s*["']([^"']+)["']"""
     )
 
     private val HTML_HREF_REGEX = Regex(
-        """<a\s+[^>]*href\s*=\s*["']([^"']+)["']""",
+        """<(?:a|audio|source)\b[^>]*\b(?:href|src)\s*=\s*["']([^"']+)["']""",
+        setOf(RegexOption.IGNORE_CASE)
+    )
+
+    private val HTML_ANCHOR_TAG_REGEX = Regex(
+        """<a\b([^>]+)>""",
+        setOf(RegexOption.IGNORE_CASE)
+    )
+
+    private val ATTR_HREF_REGEX = Regex(
+        """\bhref\s*=\s*["']([^"']+)["']""",
+        setOf(RegexOption.IGNORE_CASE)
+    )
+
+    private val ATTR_DOWNLOAD_REGEX = Regex(
+        """\b(?:download|data-filename|data-name)\s*=\s*["']([^"']+)["']""",
+        setOf(RegexOption.IGNORE_CASE)
+    )
+
+    private val SCRIPT_JSON_REGEX = Regex(
+        """<script\b[^>]*>([\s\S]*?)</script>""",
+        setOf(RegexOption.IGNORE_CASE)
+    )
+
+    private val EMBEDDED_AUDIO_URL_REGEX = Regex(
+        """["']((?:https?:\\?/\\?/|\\?/)[^"'\s<>]+\.(?:flac|wav|alac|m4a|mp4|aiff?|opus|ogg|oga|mp3|aac|webm|mka)(?:\?[^"'\s<>]*)?)["']""",
+        setOf(RegexOption.IGNORE_CASE)
+    )
+
+    private val XML_KEY_REGEX = Regex(
+        """<Key>([^<]+)</Key>""",
         setOf(RegexOption.IGNORE_CASE)
     )
 
@@ -55,7 +106,8 @@ object FlexibleTrackParser {
     fun parseCatalogPayload(
         rawPayload: String,
         contentType: String?,
-        baseUrl: String
+        baseUrl: String,
+        allowHtmlFallback: Boolean = true
     ): List<TrackEntity> {
         val trimmed = rawPayload.trim()
         if (trimmed.isEmpty()) return emptyList()
@@ -72,12 +124,24 @@ object FlexibleTrackParser {
             return parseM3uPlaylist(trimmed, baseUrl)
         }
 
-        // 3. HTML directory listing fallback
-        if (mime.contains("html") || trimmed.contains("<html", ignoreCase = true) || trimmed.contains("<a ", ignoreCase = true)) {
-            return parseHtmlDirectoryLinks(trimmed, baseUrl)
+        // 3. XML S3/object-storage bucket listing (ignore XML error responses)
+        if ((mime.contains("xml") || trimmed.startsWith("<?xml", ignoreCase = true) ||
+                trimmed.contains("<ListBucketResult", ignoreCase = true)) &&
+            !trimmed.contains("<html", ignoreCase = true)
+        ) {
+            if (trimmed.contains("<Error>", ignoreCase = true)) return emptyList()
+            return parseXmlBucketListing(trimmed, baseUrl)
         }
 
-        // 4. Plain-text URL/filename list (e.g., tracks.txt)
+        // 4. HTML directory listing / player page fallback
+        if (mime.contains("html") || trimmed.startsWith("<!doctype", ignoreCase = true) ||
+            trimmed.startsWith("<", ignoreCase = true) ||
+            trimmed.contains("<html", ignoreCase = true) || trimmed.contains("<a ", ignoreCase = true)
+        ) {
+            return if (allowHtmlFallback) parseHtmlDirectoryLinks(trimmed, baseUrl) else emptyList()
+        }
+
+        // 5. Plain-text URL/filename list (e.g., tracks.txt)
         return parsePlainTextList(trimmed, baseUrl)
     }
 
@@ -152,12 +216,172 @@ object FlexibleTrackParser {
         val seen = HashSet<String>()
         val tracks = mutableListOf<TrackEntity>()
         HTML_HREF_REGEX.findAll(html).forEach { match ->
-            val href = match.groupValues[1].trim()
-            if (href.isEmpty() || href == "../" || href.startsWith("?") || href.startsWith("#")) {
+            val href = decodeHtmlEntities(match.groupValues[1].trim())
+            if (href.isEmpty() || href == "../" || href.startsWith("?") || href.startsWith("#") ||
+                href.startsWith("javascript:", ignoreCase = true) ||
+                href.startsWith("mailto:", ignoreCase = true) ||
+                href.startsWith("data:", ignoreCase = true)
+            ) {
                 return@forEach
             }
             if (!isSupportedAudioUrl(href)) return@forEach
-            val track = buildTrackFromUrl(href, baseUrl, tracks.size) ?: return@forEach
+            val track = buildTrackFromUrl(
+                rawUrlOrFilename = href,
+                baseUrl = baseUrl,
+                index = tracks.size,
+                originRootForLeadingSlash = true
+            ) ?: return@forEach
+            if (seen.add(track.streamUrl)) {
+                tracks.add(track)
+            }
+        }
+
+        // Support <a href="/api/download/123" download="01 - Track.flac">
+        if (tracks.isEmpty()) {
+            HTML_ANCHOR_TAG_REGEX.findAll(html).forEach { tagMatch ->
+                val attrs = tagMatch.groupValues[1]
+                val href = ATTR_HREF_REGEX.find(attrs)?.groupValues?.get(1)?.let { decodeHtmlEntities(it.trim()) }
+                    ?: return@forEach
+                val downloadName = ATTR_DOWNLOAD_REGEX.find(attrs)?.groupValues?.get(1)?.let { decodeHtmlEntities(it.trim()) }
+                    ?: return@forEach
+                if (!isSupportedAudioUrl(downloadName) || href.startsWith("#") || href.startsWith("javascript:", ignoreCase = true)) {
+                    return@forEach
+                }
+                val resolvedUrl = resolveUrl(baseUrl, href, originRootForLeadingSlash = true) ?: return@forEach
+                val meta = parseFilenameAndPathMetadata(downloadName, baseUrl, tracks.size)
+                val track = TrackEntity(
+                    id = stableTrackId(resolvedUrl),
+                    title = meta.title,
+                    artist = meta.artist,
+                    album = meta.album,
+                    albumArtUrl = null,
+                    streamUrl = resolvedUrl,
+                    format = inferFormatFromUrl(downloadName),
+                    sampleRateHz = meta.sampleRateHz,
+                    bitDepth = meta.bitDepth,
+                    bitrateKbps = 0,
+                    durationMs = 0L,
+                    trackNumber = meta.trackNumber,
+                    genre = "",
+                    metadataEnriched = false
+                )
+                if (seen.add(track.streamUrl)) {
+                    tracks.add(track)
+                }
+            }
+        }
+
+        // Check embedded JSON inside <script> tags (e.g. Next.js __NEXT_DATA__)
+        if (tracks.isEmpty()) {
+            SCRIPT_JSON_REGEX.findAll(html).forEach { scriptMatch ->
+                val scriptBody = scriptMatch.groupValues[1].trim()
+                if ((scriptBody.startsWith("{") || scriptBody.startsWith("[")) && scriptBody.length <= 512 * 1024) {
+                    val parsedJsonTracks = runCatching { parseTracksFromArbitraryJson(scriptBody, baseUrl) }
+                        .getOrDefault(emptyList())
+                    parsedJsonTracks.forEach { track ->
+                        if (seen.add(track.streamUrl)) {
+                            tracks.add(track)
+                        }
+                    }
+                }
+            }
+        }
+
+        if (tracks.isEmpty()) {
+            EMBEDDED_AUDIO_URL_REGEX.findAll(html).forEach { match ->
+                val raw = match.groupValues[1]
+                    .replace("\\/", "/")
+                    .replace("\\u0026", "&")
+                    .replace("\\u002F", "/", ignoreCase = true)
+                    .trim()
+                val decoded = decodeHtmlEntities(raw)
+                if (!isSupportedAudioUrl(decoded)) return@forEach
+                val track = buildTrackFromUrl(
+                    rawUrlOrFilename = decoded,
+                    baseUrl = baseUrl,
+                    index = tracks.size,
+                    originRootForLeadingSlash = true
+                ) ?: return@forEach
+                if (seen.add(track.streamUrl)) {
+                    tracks.add(track)
+                }
+            }
+        }
+        return tracks
+    }
+
+    private fun parseTracksFromArbitraryJson(rawJson: String, baseUrl: String): List<TrackEntity> {
+        val root = json.parseToJsonElement(rawJson)
+        val collected = mutableListOf<TrackEntity>()
+        val seen = HashSet<String>()
+
+        fun visit(element: JsonElement) {
+            when (element) {
+                is JsonArray -> element.forEach { visit(it) }
+                is JsonObject -> {
+                    val urlCandidate = element.firstString(
+                        "downloadUrl", "download_url", "streamUrl", "stream_url", "audioUrl", "audio_url",
+                        "presignedUrl", "signedUrl", "rawUrl", "fileUrl", "file_url", "url"
+                    )
+                    val nameCandidate = element.firstString("fileName", "filename", "name", "title")
+                    val hasAudioHint = (urlCandidate != null && isSupportedAudioUrl(urlCandidate)) ||
+                        (nameCandidate != null && isSupportedAudioUrl(nameCandidate)) ||
+                        (element.firstString("mimeType", "contentType", "type")?.startsWith("audio/", ignoreCase = true) == true)
+
+                    if (urlCandidate != null && hasAudioHint) {
+                        val resolved = resolveUrl(baseUrl, urlCandidate, originRootForLeadingSlash = true)
+                        if (resolved != null && seen.add(resolved)) {
+                            val inferredName = nameCandidate?.takeIf { isSupportedAudioUrl(it) } ?: resolved
+                            val fallback = parseFilenameAndPathMetadata(inferredName, baseUrl, collected.size)
+                            val format = element.firstString("format", "codec", "mimeType", "extension")
+                                ?.uppercase()?.removePrefix("AUDIO/")?.removePrefix(".")
+                                ?.takeIf { it.isNotBlank() } ?: inferFormatFromUrl(inferredName)
+                            collected.add(
+                                TrackEntity(
+                                    id = element.firstString("id", "trackId", "_id") ?: stableTrackId(resolved),
+                                    title = element.firstString("title", "name")?.substringBeforeLast('.')?.takeIf { it.isNotBlank() }
+                                        ?: fallback.title,
+                                    artist = element.firstString("artist", "artistName")?.takeIf { it.isNotBlank() }
+                                        ?: fallback.artist,
+                                    album = element.firstString("album", "albumTitle")?.takeIf { it.isNotBlank() }
+                                        ?: fallback.album,
+                                    albumArtUrl = element.firstString("albumArtUrl", "coverUrl", "artworkUrl")
+                                        ?.let { resolveUrl(baseUrl, it, originRootForLeadingSlash = true) },
+                                    streamUrl = resolved,
+                                    format = format,
+                                    sampleRateHz = fallback.sampleRateHz,
+                                    bitDepth = fallback.bitDepth,
+                                    bitrateKbps = 0,
+                                    durationMs = parseDurationMs(element),
+                                    trackNumber = fallback.trackNumber,
+                                    genre = element.firstString("genre") ?: "",
+                                    metadataEnriched = false
+                                )
+                            )
+                        }
+                    }
+                    element.values.forEach { visit(it) }
+                }
+                else -> Unit
+            }
+        }
+
+        visit(root)
+        return collected
+    }
+
+    fun parseXmlBucketListing(xml: String, baseUrl: String): List<TrackEntity> {
+        val seen = HashSet<String>()
+        val tracks = mutableListOf<TrackEntity>()
+        XML_KEY_REGEX.findAll(xml).forEach { match ->
+            val key = decodeHtmlEntities(match.groupValues[1].trim())
+            if (key.isEmpty() || !isSupportedAudioUrl(key)) return@forEach
+            val track = buildTrackFromUrl(
+                rawUrlOrFilename = key,
+                baseUrl = baseUrl,
+                index = tracks.size,
+                originRootForLeadingSlash = false
+            ) ?: return@forEach
             if (seen.add(track.streamUrl)) {
                 tracks.add(track)
             }
@@ -170,7 +394,7 @@ object FlexibleTrackParser {
         val tracks = mutableListOf<TrackEntity>()
         text.lineSequence().forEach { rawLine ->
             val line = rawLine.trim().trim('"', '\'')
-            if (line.isEmpty() || line.startsWith("#")) return@forEach
+            if (line.isEmpty() || line.startsWith("#") || line.startsWith("<")) return@forEach
             if (!isSupportedAudioUrl(line)) return@forEach
             val track = buildTrackFromUrl(line, baseUrl, tracks.size) ?: return@forEach
             if (seen.add(track.streamUrl)) {
@@ -187,9 +411,14 @@ object FlexibleTrackParser {
         overrideTitle: String? = null,
         overrideArtist: String? = null,
         overrideAlbum: String? = null,
-        overrideDurationMs: Long = 0L
+        overrideDurationMs: Long = 0L,
+        originRootForLeadingSlash: Boolean = false
     ): TrackEntity? {
-        val resolvedStreamUrl = resolveUrl(baseUrl, rawUrlOrFilename) ?: return null
+        val resolvedStreamUrl = resolveUrl(
+            baseUrl = baseUrl,
+            pathOrUrl = rawUrlOrFilename,
+            originRootForLeadingSlash = originRootForLeadingSlash
+        ) ?: return null
         val format = inferFormatFromUrl(resolvedStreamUrl)
         val parsed = parseFilenameAndPathMetadata(resolvedStreamUrl, baseUrl, index)
 
@@ -373,37 +602,112 @@ object FlexibleTrackParser {
         return null
     }
 
+    fun extractDeepStoragePublicShareInfo(html: String, pageUrl: String): DeepStorageShareInfo? {
+        if (html.isBlank()) return null
+        val parsedUrl = pageUrl.toHttpUrlOrNull() ?: return null
+        val looksLikeDeepStorageShare =
+            html.contains("PAGE_USERNAME", ignoreCase = false) ||
+                html.contains("/assets/public_page.js", ignoreCase = true) ||
+                html.contains("/public/api/files/", ignoreCase = true)
+        if (!looksLikeDeepStorageShare) return null
+
+        val username = DEEPSTORAGE_PAGE_USERNAME_REGEX.find(html)?.groupValues?.get(1)?.trim()
+            ?.takeIf { it.isNotEmpty() }
+            ?: parsedUrl.pathSegments.firstOrNull { it.isNotBlank() }
+            ?: return null
+
+        val portSuffix = if ((parsedUrl.scheme == "https" && parsedUrl.port == 443) ||
+            (parsedUrl.scheme == "http" && parsedUrl.port == 80)
+        ) "" else ":${parsedUrl.port}"
+        val origin = "${parsedUrl.scheme}://${parsedUrl.host}$portSuffix"
+        return DeepStorageShareInfo(apiOrigin = origin, username = username)
+    }
+
+    fun parseDeepStorageFilesPage(rawJson: String, baseUrl: String): DeepStorageFilesPage {
+        val root = json.parseToJsonElement(rawJson) as? JsonObject
+            ?: return DeepStorageFilesPage(emptyList(), emptyList(), hasMore = false, nextOffset = 0)
+
+        val filesArray = root["files"] as? JsonArray ?: JsonArray(emptyList())
+        val tracks = mutableListOf<TrackEntity>()
+        filesArray.forEachIndexed { idx, element ->
+            val obj = element as? JsonObject ?: return@forEachIndexed
+            val fileName = obj.firstString("file_name", "fileName", "name") ?: ""
+            val fileLink = obj.firstString("file_link", "fileLink", "downloadUrl", "download_url", "streamUrl", "url")
+                ?: return@forEachIndexed
+            val candidateName = fileName.ifBlank { fileLink }
+            val ext = candidateName.substringBefore('?').substringBefore('#')
+                .substringAfterLast('.', "").lowercase()
+            if (fileName == ".keep" || ext !in STRICT_AUDIO_EXTENSIONS) {
+                return@forEachIndexed
+            }
+            parseTrackObject(obj, baseUrl, idx)?.let { tracks.add(it) }
+        }
+
+        val foldersArray = root["folders"] as? JsonArray ?: JsonArray(emptyList())
+        val folders = foldersArray.mapNotNull { elem ->
+            when (elem) {
+                is JsonPrimitive -> elem.contentOrNull?.trim()?.takeIf { it.isNotEmpty() }
+                is JsonObject -> elem.firstString("name", "folder_name", "path")
+                else -> null
+            }
+        }
+
+        val hasMore = (root["has_more"] as? JsonPrimitive)?.contentOrNull?.equals("true", ignoreCase = true) == true
+        val nextOffset = root.firstInt("next_offset", "nextOffset")
+
+        return DeepStorageFilesPage(
+            tracks = tracks,
+            folders = folders,
+            hasMore = hasMore,
+            nextOffset = nextOffset
+        )
+    }
+
     private fun parseTrackObject(
         obj: JsonObject,
         baseUrl: String,
         index: Int
     ): TrackEntity? {
         val rawStreamUrl = obj.firstString(
-            "streamUrl", "stream_url", "audioUrl", "audio_url", "url", "src", "fileUrl", "file_url", "file", "path"
+            "streamUrl", "stream_url", "audioUrl", "audio_url",
+            "file_link", "fileLink", "downloadUrl", "download_url",
+            "url", "src", "fileUrl", "file_url", "file", "path"
         ) ?: return null
 
-        val resolvedStreamUrl = resolveUrl(baseUrl, rawStreamUrl) ?: return null
-        val fallback = parseFilenameAndPathMetadata(resolvedStreamUrl, baseUrl, index)
+        val explicitFileName = obj.firstString("file_name", "fileName")
+        val resolvedStreamUrl = resolveUrl(baseUrl, rawStreamUrl, originRootForLeadingSlash = true) ?: return null
+        val metadataUrlOrName = explicitFileName?.takeIf { it.isNotBlank() } ?: resolvedStreamUrl
+        val fallback = parseFilenameAndPathMetadata(metadataUrlOrName, baseUrl, index)
+
+        val folderPath = obj.firstString("folder_path", "folderPath")
+            ?.removePrefix("/Shareable Folder")
+            ?.trim('/')
+            ?.takeIf { it.isNotEmpty() }
+            ?.substringAfterLast('/')
+            ?.let { cleanDisplaySegment(it) }
 
         val id = obj.firstString("id", "trackId", "track_id", "_id", "uuid")
             ?: stableTrackId(resolvedStreamUrl)
-        val title = obj.firstString("title", "name", "trackTitle", "track_title")
-            ?.takeIf { it.isNotBlank() } ?: fallback.title
+        val rawTitle = obj.firstString("title", "trackTitle", "track_title")
+            ?: obj.firstString("name")?.substringBeforeLast('.')
+        val title = rawTitle?.takeIf { it.isNotBlank() } ?: fallback.title
         val artist = obj.firstString("artist", "artistName", "artist_name", "albumArtist")
             ?.takeIf { it.isNotBlank() } ?: fallback.artist
         val album = obj.firstString("album", "albumTitle", "album_title", "albumName")
-            ?.takeIf { it.isNotBlank() } ?: fallback.album
+            ?.takeIf { it.isNotBlank() }
+            ?: folderPath
+            ?: fallback.album
         val rawArtUrl = obj.firstString(
             "albumArtUrl", "album_art_url", "coverUrl", "cover_url", "artworkUrl", "artwork", "cover", "image"
         )
-        val resolvedArtUrl = rawArtUrl?.let { resolveUrl(baseUrl, it) }
+        val resolvedArtUrl = rawArtUrl?.let { resolveUrl(baseUrl, it, originRootForLeadingSlash = true) }
 
         val format = obj.firstString("format", "codec", "mimeType", "extension", "fileType")
             ?.uppercase()
             ?.removePrefix("AUDIO/")
             ?.removePrefix(".")
             ?.takeIf { it.isNotBlank() }
-            ?: inferFormatFromUrl(resolvedStreamUrl)
+            ?: inferFormatFromUrl(metadataUrlOrName)
 
         val sampleRateHz = obj.firstInt("sampleRateHz", "sample_rate_hz", "sampleRate", "sample_rate")
             .let { sr ->
@@ -477,7 +781,21 @@ object FlexibleTrackParser {
         }
     }
 
-    fun resolveUrl(baseUrl: String, pathOrUrl: String): String? {
+    fun decodeHtmlEntities(value: String): String {
+        return value
+            .replace("&amp;", "&", ignoreCase = true)
+            .replace("&quot;", "\"", ignoreCase = true)
+            .replace("&#39;", "'")
+            .replace("&apos;", "'", ignoreCase = true)
+            .replace("&lt;", "<", ignoreCase = true)
+            .replace("&gt;", ">", ignoreCase = true)
+    }
+
+    fun resolveUrl(
+        baseUrl: String,
+        pathOrUrl: String,
+        originRootForLeadingSlash: Boolean = false
+    ): String? {
         val trimmed = pathOrUrl.trim()
         if (trimmed.isEmpty()) return null
         if (trimmed.startsWith("http://", ignoreCase = true) ||
@@ -488,6 +806,16 @@ object FlexibleTrackParser {
         val base = baseUrl.trim().trimEnd('/').toHttpUrlOrNull() ?: return null
         if (trimmed.startsWith("//")) {
             return "${base.scheme}:$trimmed"
+        }
+        if (trimmed.startsWith("/")) {
+            val basePath = base.encodedPath.trimEnd('/')
+            if (originRootForLeadingSlash ||
+                (basePath.isNotEmpty() &&
+                    (trimmed.equals(basePath, ignoreCase = true) ||
+                        trimmed.startsWith("$basePath/", ignoreCase = true)))
+            ) {
+                return base.resolve(trimmed)?.toString()
+            }
         }
         // Preserve any subpath on the base URL (e.g. https://deepstorage.dev/testappuser/)
         val baseWithTrailingSlash = "${base.toString().trimEnd('/')}/".toHttpUrlOrNull() ?: base

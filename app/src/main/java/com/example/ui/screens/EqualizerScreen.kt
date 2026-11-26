@@ -3,6 +3,7 @@ package com.example.ui.screens
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.horizontalScroll
@@ -19,6 +20,8 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -67,6 +70,7 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.R
 import com.example.data.model.BuiltInEqPresets
@@ -211,17 +215,30 @@ fun EqualizerScreen(
 
         Spacer(modifier = Modifier.height(14.dp))
 
-        // Presets Carousel + Save/Reset
+        // Presets Carousel + Save/Reset + Active Preset Summary
+        val allPresets = BuiltInEqPresets.all + state.customPresets
+        val activePreset = BuiltInEqPresets.findById(state.selectedPresetId, state.customPresets)
+
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            Text(
-                text = "PRESETS",
-                style = TelemetryTextStyle,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "C++ DSP PRESETS",
+                    style = TelemetryTextStyle,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Text(
+                    text = activePreset?.description?.ifBlank { "Custom user-saved curve" }
+                        ?: "Custom 10-band manual curve",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(
                     onClick = { showSaveDialog = true },
@@ -248,46 +265,21 @@ fun EqualizerScreen(
             }
         }
 
-        Spacer(modifier = Modifier.height(8.dp))
+        Spacer(modifier = Modifier.height(10.dp))
 
-        val allPresets = BuiltInEqPresets.all + state.customPresets
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .horizontalScroll(rememberScrollState()),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        LazyRow(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            allPresets.forEach { preset ->
+            items(allPresets, key = { it.id }) { preset ->
                 val selected = state.selectedPresetId == preset.id
-                FilterChip(
+                PresetCurveCard(
+                    preset = preset,
                     selected = selected,
                     onClick = { onSelectPreset(preset) },
-                    label = { Text(preset.name, style = MaterialTheme.typography.labelLarge) },
-                    trailingIcon = if (!preset.isBuiltIn) {
-                        {
-                            Icon(
-                                imageVector = Icons.Filled.Close,
-                                contentDescription = "Delete ${preset.name}",
-                                modifier = Modifier
-                                    .size(16.dp)
-                                    .pointerInput(preset.id) {
-                                        detectTapGestures(onTap = { onDeleteCustomPreset(preset.id) })
-                                    }
-                            )
-                        }
-                    } else null,
-                    colors = FilterChipDefaults.filterChipColors(
-                        containerColor = StudioConsole,
-                        selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
-                        selectedLabelColor = MaterialTheme.colorScheme.primary
-                    ),
-                    border = FilterChipDefaults.filterChipBorder(
-                        enabled = true,
-                        selected = selected,
-                        borderColor = HairlineBorder,
-                        selectedBorderColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.6f)
-                    ),
-                    modifier = Modifier.testTag("eq_preset_${preset.id}")
+                    onDelete = if (!preset.isBuiltIn) {
+                        { onDeleteCustomPreset(preset.id) }
+                    } else null
                 )
             }
         }
@@ -667,3 +659,123 @@ private fun DspEffectCard(
         }
     }
 }
+
+@Composable
+private fun PresetCurveCard(
+    preset: EqualizerPreset,
+    selected: Boolean,
+    onClick: () -> Unit,
+    onDelete: (() -> Unit)?
+) {
+    val accent = if (selected) MaterialTheme.colorScheme.primary else LosslessCyan
+    val borderColor = if (selected) MaterialTheme.colorScheme.primary else HairlineBorder
+    val bgColor = if (selected) {
+        MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.28f)
+    } else {
+        StudioConsole
+    }
+
+    Surface(
+        shape = RoundedCornerShape(14.dp),
+        color = bgColor,
+        border = BorderStroke(1.dp, borderColor),
+        modifier = Modifier
+            .width(126.dp)
+            .testTag("eq_preset_${preset.id}")
+            .clickable(onClick = onClick)
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 9.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = if (preset.isBuiltIn) preset.category.uppercase() else "CUSTOM",
+                    style = TelemetryTextStyle,
+                    color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1
+                )
+                if (onDelete != null) {
+                    Icon(
+                        imageVector = Icons.Filled.Close,
+                        contentDescription = "Delete ${preset.name}",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier
+                            .size(16.dp)
+                            .clickable(onClick = onDelete)
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = preset.name,
+                style = MaterialTheme.typography.titleSmall,
+                color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Spacer(modifier = Modifier.height(6.dp))
+            MiniPresetCurvePreview(
+                bandLevelsDb = preset.bandLevelsDb,
+                lineColor = accent,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(22.dp)
+            )
+            Spacer(modifier = Modifier.height(5.dp))
+            val bassPct = (preset.bassBoost / 10).coerceIn(0, 100)
+            val spacePct = (preset.virtualizer / 10).coerceIn(0, 100)
+            Text(
+                text = if (bassPct == 0 && spacePct == 0) "0 dB Direct" else "B $bassPct% · S $spacePct%",
+                style = TelemetryTextStyle,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1
+            )
+        }
+    }
+}
+
+@Composable
+private fun MiniPresetCurvePreview(
+    bandLevelsDb: List<Float>,
+    lineColor: Color,
+    modifier: Modifier = Modifier
+) {
+    Canvas(modifier = modifier) {
+        val w = size.width
+        val h = size.height
+        val pad = 3.dp.toPx()
+        val usableH = (h - pad * 2).coerceAtLeast(1f)
+        val midY = pad + usableH / 2f
+
+        drawLine(
+            color = HairlineBorder.copy(alpha = 0.6f),
+            start = Offset(0f, midY),
+            end = Offset(w, midY),
+            strokeWidth = 1.dp.toPx()
+        )
+        if (bandLevelsDb.isEmpty()) return@Canvas
+
+        val pts = bandLevelsDb.mapIndexed { idx, db ->
+            val x = if (bandLevelsDb.size == 1) w / 2f else (idx.toFloat() / (bandLevelsDb.size - 1)) * w
+            val norm = ((-db.coerceIn(-10f, 10f)) + 10f) / 20f
+            Offset(x, pad + norm * usableH)
+        }
+        val path = Path().apply {
+            moveTo(pts.first().x, pts.first().y)
+            for (i in 0 until pts.lastIndex) {
+                val p0 = pts[i]
+                val p1 = pts[i + 1]
+                val cx = (p0.x + p1.x) / 2f
+                cubicTo(cx, p0.y, cx, p1.y, p1.x, p1.y)
+            }
+        }
+        drawPath(
+            path = path,
+            color = lineColor,
+            style = Stroke(width = 2.dp.toPx(), cap = StrokeCap.Round)
+        )
+    }
+}
+

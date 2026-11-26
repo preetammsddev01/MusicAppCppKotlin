@@ -6,10 +6,12 @@ import com.example.data.model.PlaylistWithTracks
 import com.example.data.model.TrackEntity
 import com.example.data.remote.CloudMusicRepository
 import com.example.playback.PlaybackController
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
@@ -72,11 +74,13 @@ class LibraryViewModel(
             artists = bundle.all.groupIntoArtists(),
             allTracks = bundle.all
         )
-    }.stateIn(
-        scope = viewModelScope,
-        started = SharingStarted.WhileSubscribed(5000),
-        initialValue = LibraryUiState()
-    )
+    }
+        .flowOn(Dispatchers.Default)
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = LibraryUiState()
+        )
 
     fun selectTab(tab: LibraryTab) {
         activeTab.value = tab

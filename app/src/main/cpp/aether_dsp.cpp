@@ -24,8 +24,8 @@ inline int32_t bytesPerSample(PcmEncoding encoding) {
 }
 
 inline double softLimit(double sample) {
-    // Transparent linear region up to -1.2 dBFS (0.87), smooth tanh saturation above
-    constexpr double kThreshold = 0.87;
+    // Transparent linear region up to -0.45 dBFS (0.95), smooth tanh saturation above
+    constexpr double kThreshold = 0.95;
     const double absVal = std::abs(sample);
     if (absVal <= kThreshold) {
         return sample;
@@ -108,7 +108,6 @@ inline void writeNormalizedSample(uint8_t* ptr, PcmEncoding encoding, double val
 }  // namespace
 
 AetherDspEngine::AetherDspEngine() {
-    sideDelayBuffer_.assign(512, 0.0);
     bandGainsDb_.fill(0.0f);
     rebuildCoefficientsLocked();
 }
@@ -118,15 +117,7 @@ void AetherDspEngine::configure(int32_t sampleRateHz, int32_t channelCount, PcmE
     sampleRateHz_ = std::max(sampleRateHz, 8000);
     channelCount_ = std::clamp(channelCount, 1, kMaxChannels);
     encoding_ = encoding;
-
-    // 0.35 ms spatial crossfeed delay sized for the live sample rate
-    const size_t delayLen = std::max<size_t>(
-        4,
-        static_cast<size_t>(std::lround(static_cast<double>(sampleRateHz_) * 0.00035))
-    );
-    sideDelaySamples_ = delayLen;
-    sideDelayBuffer_.assign(delayLen + 4, 0.0);
-    sideDelayIndex_ = 0;
+    sideApZ1_ = 0.0;
 
     for (auto& filter : eqFilters_) {
         filter.resetState();
@@ -141,8 +132,7 @@ void AetherDspEngine::resetState() {
         filter.resetState();
     }
     bassShelfFilter_.resetState();
-    std::fill(sideDelayBuffer_.begin(), sideDelayBuffer_.end(), 0.0);
-    sideDelayIndex_ = 0;
+    sideApZ1_ = 0.0;
 }
 
 void AetherDspEngine::updateParameters(
@@ -198,10 +188,10 @@ void AetherDspEngine::rebuildCoefficientsLocked() {
         bassGainDb
     );
 
-    // Mid/Side spatial width + subtle crossfeed ambience
+    // Mid/Side spatial width + flat-magnitude all-pass ambience (no comb-filter notches)
     const double virtNorm = dspEnabled_ ? (static_cast<double>(virtualizerStrength_) / 1000.0) : 0.0;
-    stereoWidth_ = 1.0 + (0.65 * virtNorm);
-    virtualizerMix_ = 0.16 * virtNorm;
+    stereoWidth_ = 1.0 + (0.45 * virtNorm);
+    virtualizerMix_ = 0.12 * virtNorm;
 
     // Gentle preamp headroom compensation to keep boosts clean and unclipped
     const double totalBoostEstimate = std::max(0.0, maxPositiveGain * 0.35 + bassGainDb * 0.30);
@@ -310,7 +300,7 @@ void AetherDspEngine::processFrames(
 
     double frameSamples[kMaxChannels]{};
     const bool applyVirtualizer = (channelCount_ >= 2) && (virtualizerStrength_ > 0);
-    const size_t delaySize = sideDelayBuffer_.size();
+    constexpr double kAllPassG = 0.65;
 
     for (int32_t frame = 0; frame < frameCount; ++frame) {
         const uint8_t* inFrame = input + static_cast<size_t>(frame) * static_cast<size_t>(frameBytes);
@@ -329,19 +319,17 @@ void AetherDspEngine::processFrames(
             frameSamples[ch] = x;
         }
 
-        // Mid/Side Stereo Spatial Virtualizer on front L/R pair
-        if (applyVirtualizer && delaySize > 0) {
+        // Artifact-free Mid/Side Stereo Spatial Virtualizer on front L/R pair
+        if (applyVirtualizer) {
             const double left = frameSamples[0];
             const double right = frameSamples[1];
             const double mid = 0.5 * (left + right);
             const double side = 0.5 * (left - right);
 
-            const size_t readIdx = (sideDelayIndex_ + delaySize - sideDelaySamples_) % delaySize;
-            const double delayedSide = sideDelayBuffer_[readIdx];
-            sideDelayBuffer_[sideDelayIndex_] = side;
-            sideDelayIndex_ = (sideDelayIndex_ + 1) % delaySize;
+            const double apSide = kAllPassG * side + sideApZ1_;
+            sideApZ1_ = side - kAllPassG * apSide;
 
-            const double widenedSide = (side * stereoWidth_) + (delayedSide * virtualizerMix_);
+            const double widenedSide = (side * stereoWidth_) + (apSide * virtualizerMix_);
             frameSamples[0] = mid + widenedSide;
             frameSamples[1] = mid - widenedSide;
         }

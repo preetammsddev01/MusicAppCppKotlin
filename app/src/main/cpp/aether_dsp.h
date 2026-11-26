@@ -103,10 +103,8 @@ private:
     std::array<BiquadFilter, kNumEqBands> eqFilters_{};
     BiquadFilter bassShelfFilter_{};
 
-    // Stereo Mid/Side spatial crossfeed delay line (pre-allocated for up to 384 kHz)
-    std::vector<double> sideDelayBuffer_;
-    size_t sideDelayIndex_ = 0;
-    size_t sideDelaySamples_ = 16;
+    // All-pass phase decorrelator state for artifact-free M/S spatial width
+    double sideApZ1_ = 0.0;
     double stereoWidth_ = 1.0;
     double virtualizerMix_ = 0.0;
 };

@@ -11,8 +11,13 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.EnterTransition
+import androidx.compose.animation.ExitTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
@@ -23,7 +28,9 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Equalizer
 import androidx.compose.material.icons.filled.Home
@@ -42,6 +49,7 @@ import androidx.compose.material3.NavigationRail
 import androidx.compose.material3.NavigationRailItem
 import androidx.compose.material3.NavigationRailItemDefaults
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -74,6 +82,7 @@ import com.example.ui.screens.LibraryScreen
 import com.example.ui.screens.NowPlayingOverlay
 import com.example.ui.screens.SearchScreen
 import com.example.ui.theme.AetherAudioTheme
+import com.example.ui.theme.ErrorCoral
 import com.example.ui.theme.ObsidianBg
 import com.example.ui.theme.StudioConsole
 import com.example.ui.viewmodel.AppViewModelFactory
@@ -114,12 +123,11 @@ class MainActivity : ComponentActivity() {
             val playerViewModel: PlayerViewModel = viewModel(factory = factory)
             val equalizerViewModel: EqualizerViewModel = viewModel(factory = factory)
 
-            val playerState by playerViewModel.uiState.collectAsStateWithLifecycle()
-            val eqState by equalizerViewModel.uiState.collectAsStateWithLifecycle()
+            val accentColors by playerViewModel.accentColors.collectAsStateWithLifecycle()
 
             AetherAudioTheme(
-                dynamicAccent = playerState.accentColor,
-                dynamicSecondary = playerState.secondaryGlowColor
+                dynamicAccent = accentColors.primaryAccent,
+                dynamicSecondary = accentColors.secondaryGlow
             ) {
                 NotificationPermissionEffect()
                 AetherAudioConsumerShell(
@@ -127,8 +135,7 @@ class MainActivity : ComponentActivity() {
                     searchViewModel = searchViewModel,
                     libraryViewModel = libraryViewModel,
                     playerViewModel = playerViewModel,
-                    equalizerViewModel = equalizerViewModel,
-                    isDspEnabled = eqState.isDspEnabled
+                    equalizerViewModel = equalizerViewModel
                 )
             }
         }
@@ -142,6 +149,13 @@ class MainActivity : ComponentActivity() {
     override fun onStop() {
         (application as AetherAudioApp).playbackController.disconnect()
         super.onStop()
+    }
+
+    override fun onDestroy() {
+        if (isFinishing && !isChangingConfigurations) {
+            (application as AetherAudioApp).playbackController.cleanupTempCacheIfIdle()
+        }
+        super.onDestroy()
     }
 }
 
@@ -181,29 +195,28 @@ private fun AetherAudioConsumerShell(
     searchViewModel: SearchViewModel,
     libraryViewModel: LibraryViewModel,
     playerViewModel: PlayerViewModel,
-    equalizerViewModel: EqualizerViewModel,
-    isDspEnabled: Boolean
+    equalizerViewModel: EqualizerViewModel
 ) {
     val navController = rememberNavController()
     val backStackEntry by navController.currentBackStackEntryAsState()
     val currentDestination = backStackEntry?.destination
 
-    val homeState by homeViewModel.uiState.collectAsStateWithLifecycle()
-    val searchState by searchViewModel.uiState.collectAsStateWithLifecycle()
-    val libraryState by libraryViewModel.uiState.collectAsStateWithLifecycle()
     val playerState by playerViewModel.uiState.collectAsStateWithLifecycle()
-    val eqState by equalizerViewModel.uiState.collectAsStateWithLifecycle()
 
     var isNowPlayingExpanded by rememberSaveable { mutableStateOf(false) }
     var playlistTargetTrack by remember { mutableStateOf<TrackEntity?>(null) }
 
-    fun navigateTop(route: Any) {
-        navController.navigate(route) {
-            popUpTo(navController.graph.findStartDestination().id) {
-                saveState = true
+    val navigateTop = remember(navController) {
+        { route: Any ->
+            if (navController.currentBackStackEntry?.destination?.hasRoute(route::class) != true) {
+                navController.navigate(route) {
+                    popUpTo(navController.graph.findStartDestination().id) {
+                        saveState = true
+                    }
+                    launchSingleTop = true
+                    restoreState = true
+                }
             }
-            launchSingleTop = true
-            restoreState = true
         }
     }
 
@@ -248,14 +261,34 @@ private fun AetherAudioConsumerShell(
                         .statusBarsPadding()
                 ) {
                     val railMiniPlayerPadding = if (useNavigationRail && playerState.currentTrack != null) 88.dp else 0.dp
+                    val bottomContentPadding = remember(railMiniPlayerPadding) {
+                        PaddingValues(bottom = railMiniPlayerPadding)
+                    }
 
                     Box(modifier = Modifier.weight(1f)) {
                         NavHost(
                             navController = navController,
                             startDestination = HomeRoute,
+                            enterTransition = { EnterTransition.None },
+                            exitTransition = { ExitTransition.None },
+                            popEnterTransition = { EnterTransition.None },
+                            popExitTransition = { ExitTransition.None },
                             modifier = Modifier.fillMaxSize()
                         ) {
                             composable<HomeRoute> {
+                                val homeState by homeViewModel.uiState.collectAsStateWithLifecycle()
+                                val openAlbum = remember(searchViewModel, navigateTop) {
+                                    { albumName: String ->
+                                        searchViewModel.openAlbum(albumName)
+                                        navigateTop(SearchRoute)
+                                    }
+                                }
+                                val openGenre = remember(searchViewModel, navigateTop) {
+                                    { genre: String ->
+                                        searchViewModel.selectGenre(genre)
+                                        navigateTop(SearchRoute)
+                                    }
+                                }
                                 HomeScreen(
                                     uiState = homeState,
                                     currentPlayingTrackId = playerState.currentTrack?.id,
@@ -265,19 +298,17 @@ private fun AetherAudioConsumerShell(
                                     onPlayTrack = homeViewModel::playTrack,
                                     onPlayAlbum = homeViewModel::playAlbum,
                                     onToggleLike = homeViewModel::toggleLike,
-                                    onOpenAlbumInSearch = { albumName ->
-                                        searchViewModel.openAlbum(albumName)
-                                        navigateTop(SearchRoute)
-                                    },
-                                    onOpenGenreInSearch = { genre ->
-                                        searchViewModel.selectGenre(genre)
-                                        navigateTop(SearchRoute)
-                                    },
-                                    bottomContentPadding = PaddingValues(bottom = railMiniPlayerPadding)
+                                    onOpenAlbumInSearch = openAlbum,
+                                    onOpenGenreInSearch = openGenre,
+                                    bottomContentPadding = bottomContentPadding
                                 )
                             }
 
                             composable<SearchRoute> {
+                                val searchState by searchViewModel.uiState.collectAsStateWithLifecycle()
+                                val addToPlaylist = remember {
+                                    { track: TrackEntity -> playlistTargetTrack = track }
+                                }
                                 SearchScreen(
                                     uiState = searchState,
                                     currentPlayingTrackId = playerState.currentTrack?.id,
@@ -290,12 +321,19 @@ private fun AetherAudioConsumerShell(
                                     onPlayTrack = searchViewModel::playTrack,
                                     onPlayAll = searchViewModel::playAll,
                                     onToggleLike = searchViewModel::toggleLike,
-                                    onAddToPlaylist = { track -> playlistTargetTrack = track },
-                                    bottomContentPadding = PaddingValues(bottom = railMiniPlayerPadding)
+                                    onAddToPlaylist = addToPlaylist,
+                                    bottomContentPadding = bottomContentPadding
                                 )
                             }
 
                             composable<LibraryRoute> {
+                                val libraryState by libraryViewModel.uiState.collectAsStateWithLifecycle()
+                                val createPlaylist = remember(libraryViewModel) {
+                                    { name: String -> libraryViewModel.createPlaylist(name) }
+                                }
+                                val addToPlaylist = remember {
+                                    { track: TrackEntity -> playlistTargetTrack = track }
+                                }
                                 LibraryScreen(
                                     uiState = libraryState,
                                     currentPlayingTrackId = playerState.currentTrack?.id,
@@ -303,19 +341,20 @@ private fun AetherAudioConsumerShell(
                                     onSelectTab = libraryViewModel::selectTab,
                                     onOpenDetail = libraryViewModel::openDetail,
                                     onCloseDetail = libraryViewModel::closeDetail,
-                                    onCreatePlaylist = { name -> libraryViewModel.createPlaylist(name) },
+                                    onCreatePlaylist = createPlaylist,
                                     onRenamePlaylist = libraryViewModel::renamePlaylist,
                                     onDeletePlaylist = libraryViewModel::deletePlaylist,
                                     onRemoveFromPlaylist = libraryViewModel::removeTrackFromPlaylist,
                                     onToggleLike = libraryViewModel::toggleLike,
-                                    onAddToPlaylist = { track -> playlistTargetTrack = track },
+                                    onAddToPlaylist = addToPlaylist,
                                     onPlayTrack = libraryViewModel::playTrack,
                                     onPlayAll = libraryViewModel::playAll,
-                                    bottomContentPadding = PaddingValues(bottom = railMiniPlayerPadding)
+                                    bottomContentPadding = bottomContentPadding
                                 )
                             }
 
                             composable<EqualizerRoute> {
+                                val eqState by equalizerViewModel.uiState.collectAsStateWithLifecycle()
                                 EqualizerScreen(
                                     state = eqState,
                                     onToggleDsp = equalizerViewModel::toggleDspEnabled,
@@ -326,7 +365,7 @@ private fun AetherAudioConsumerShell(
                                     onResetFlat = equalizerViewModel::resetToFlat,
                                     onSaveCustomPreset = equalizerViewModel::saveCustomPreset,
                                     onDeleteCustomPreset = equalizerViewModel::deleteCustomPreset,
-                                    bottomContentPadding = PaddingValues(bottom = railMiniPlayerPadding)
+                                    bottomContentPadding = bottomContentPadding
                                 )
                             }
                         }
@@ -341,10 +380,12 @@ private fun AetherAudioConsumerShell(
                                     track = playerState.currentTrack!!,
                                     isPlaying = playerState.isPlaying,
                                     isBuffering = playerState.isBuffering,
-                                    positionMs = playerState.positionMs,
+                                    positionMsFlow = playerViewModel.positionMs,
                                     durationMs = playerState.durationMs,
                                     signalLabel = playerState.signalDisplayLabel,
                                     isHiRes = playerState.isHiResSignal,
+                                    prepStatusMessage = playerState.prepStatusMessage,
+                                    prepProgress = playerState.prepProgress,
                                     onExpand = { isNowPlayingExpanded = true },
                                     onToggleLike = playerViewModel::toggleCurrentTrackLike,
                                     onTogglePlayPause = playerViewModel::togglePlayPause,
@@ -360,15 +401,38 @@ private fun AetherAudioConsumerShell(
                                 .fillMaxWidth()
                                 .navigationBarsPadding()
                         ) {
+                            if (!isNowPlayingExpanded) {
+                                playerState.errorMessage?.let { err ->
+                                    Surface(
+                                        shape = RoundedCornerShape(10.dp),
+                                        color = ErrorCoral.copy(alpha = 0.16f),
+                                        border = BorderStroke(1.dp, ErrorCoral.copy(alpha = 0.5f)),
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(horizontal = 12.dp, vertical = 4.dp)
+                                            .testTag("mini_player_error_banner")
+                                            .clickable(onClick = playerViewModel::dismissError)
+                                    ) {
+                                        Text(
+                                            text = err,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = ErrorCoral,
+                                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                                        )
+                                    }
+                                }
+                            }
                             playerState.currentTrack?.let { activeTrack ->
                                 MiniPlayerBar(
                                     track = activeTrack,
                                     isPlaying = playerState.isPlaying,
                                     isBuffering = playerState.isBuffering,
-                                    positionMs = playerState.positionMs,
+                                    positionMsFlow = playerViewModel.positionMs,
                                     durationMs = playerState.durationMs,
                                     signalLabel = playerState.signalDisplayLabel,
                                     isHiRes = playerState.isHiResSignal,
+                                    prepStatusMessage = playerState.prepStatusMessage,
+                                    prepProgress = playerState.prepProgress,
                                     onExpand = { isNowPlayingExpanded = true },
                                     onToggleLike = playerViewModel::toggleCurrentTrackLike,
                                     onTogglePlayPause = playerViewModel::togglePlayPause,
@@ -406,14 +470,15 @@ private fun AetherAudioConsumerShell(
 
         AnimatedVisibility(
             visible = isNowPlayingExpanded && playerState.currentTrack != null,
-            enter = slideInVertically(initialOffsetY = { it }),
-            exit = slideOutVertically(targetOffsetY = { it })
+            enter = slideInVertically(animationSpec = tween(180)) { it },
+            exit = slideOutVertically(animationSpec = tween(150)) { it }
         ) {
+            val eqState by equalizerViewModel.uiState.collectAsStateWithLifecycle()
             NowPlayingOverlay(
                 playbackState = playerState,
-                isDspEnabled = isDspEnabled,
-                isNativeCppEngine = eqState.isNativeCppEngine,
-                isBitExactBypass = eqState.isBitExactBypass,
+                positionMsFlow = playerViewModel.positionMs,
+                eqState = eqState,
+                onSelectEqPreset = equalizerViewModel::selectPreset,
                 onCollapse = { isNowPlayingExpanded = false },
                 onToggleLike = playerViewModel::toggleCurrentTrackLike,
                 onAddToPlaylist = { track -> playlistTargetTrack = track },
@@ -433,6 +498,7 @@ private fun AetherAudioConsumerShell(
         }
 
         playlistTargetTrack?.let { target ->
+            val libraryState by libraryViewModel.uiState.collectAsStateWithLifecycle()
             AddToPlaylistBottomSheet(
                 track = target,
                 playlists = libraryState.playlists,
